@@ -64,14 +64,14 @@ def create_agent_settings_tab(webui_manager: WebuiManager):
             llm_provider = gr.Dropdown(
                 choices=[provider for provider, model in config.model_names.items()],
                 label="LLM Provider",
-                value=os.getenv("DEFAULT_LLM", "openai"),
+                value="openai",
                 info="Select LLM provider for LLM",
                 interactive=True
             )
             llm_model_name = gr.Dropdown(
                 label="LLM Model Name",
-                choices=config.model_names[os.getenv("DEFAULT_LLM", "openai")],
-                value=config.model_names[os.getenv("DEFAULT_LLM", "openai")][0],
+                choices=config.model_names["ollama"],
+                value="gpt-4o-mini",
                 interactive=True,
                 allow_custom_value=True,
                 info="Select a model in the dropdown options or directly type a custom model name"
@@ -89,7 +89,7 @@ def create_agent_settings_tab(webui_manager: WebuiManager):
 
             use_vision = gr.Checkbox(
                 label="Use Vision",
-                value=True,
+                value=False,
                 info="Enable Vision(Input highlighted screenshot into LLM)",
                 interactive=True
             )
@@ -108,13 +108,13 @@ def create_agent_settings_tab(webui_manager: WebuiManager):
         with gr.Row():
             llm_base_url = gr.Textbox(
                 label="Base URL",
-                value="",
+                value="https://api.openai-proxy.org/v1",
                 info="API endpoint URL (if required)"
             )
             llm_api_key = gr.Textbox(
                 label="API Key",
                 type="password",
-                value="",
+                value="sk-NQl0lA710pUeCP6WaknqnXSvR0Ee8YRhQpON3ydKp8uZTiq5",
                 info="Your API key (leave blank to use .env)"
             )
 

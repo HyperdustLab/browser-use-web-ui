@@ -1,13 +1,55 @@
 import os
+import json
 from distutils.util import strtobool
 import gradio as gr
 import logging
-from gradio.components import Component
+from gradio.components import Component  # 保持原有导入
+from typing import Optional
 
 from src.webui.webui_manager import WebuiManager
 from src.utils import config
 
 logger = logging.getLogger(__name__)
+
+# 固定的 webui.json 默认路径（即本文件所在目录下）
+DEFAULT_WEBUI_JSON_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "webui.json"
+)
+
+# 如果设置了环境变量 WEBUI_JSON_PATH，则优先用环境变量，否则用默认路径
+WEBUI_JSON_PATH = os.getenv("WEBUI_JSON_PATH", DEFAULT_WEBUI_JSON_PATH)
+
+def load_cdp_url_from_webui_json() -> Optional[str]:
+    """
+    动态读取 webui.json 的 cdp_URP 作为 CDP URL。
+    回退：环境变量 BROWSER_CDP；仍无则返回 None。
+    """
+    path = WEBUI_JSON_PATH
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            # 你的 JSON 格式为 { "cdp_URP": "http://43.159.42.14" }
+            val = cfg.get("cdp_URP")
+            if val:
+                logger.info(f"[browser_settings_tab] 使用 {path} 中的 cdp_URP: {val}")
+                return val
+            else:
+                logger.info(f"[browser_settings_tab] {path} 存在但未找到 cdp_URP 字段")
+        else:
+            logger.info(f"[browser_settings_tab] 未找到 webui.json: {path}")
+    except Exception as e:
+        logger.warning(f"[browser_settings_tab] 读取 {path} 出错: {e}")
+
+    # 回退到环境变量
+    env_val = os.getenv("BROWSER_CDP")
+    if env_val:
+        logger.info(f"[browser_settings_tab] 使用环境变量 BROWSER_CDP: {env_val}")
+        return env_val
+
+    logger.info("[browser_settings_tab] 未获取到 CDP URL（返回 None）")
+    return None
+
 
 async def close_browser(webui_manager: WebuiManager):
     """
@@ -26,6 +68,7 @@ async def close_browser(webui_manager: WebuiManager):
         logger.info("⚠️ Closing browser when changing browser config.")
         await webui_manager.bu_browser.close()
         webui_manager.bu_browser = None
+
 
 def create_browser_settings_tab(webui_manager: WebuiManager):
     """
@@ -91,9 +134,10 @@ def create_browser_settings_tab(webui_manager: WebuiManager):
             )
     with gr.Group():
         with gr.Row():
+            # ✅ 此处在渲染 UI 时动态读取 webui.json（而不是模块导入时）
             cdp_url = gr.Textbox(
                 label="CDP URL",
-                value=os.getenv("BROWSER_CDP", None),
+                value=load_cdp_url_from_webui_json(),
                 info="CDP URL for browser remote debugging",
                 interactive=True,
             )
