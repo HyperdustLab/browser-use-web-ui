@@ -3,10 +3,7 @@ services:
   browser-use-webui:
     # image: ghcr.io/browser-use/web-ui # Using precompiled image
     build:
-      context: .
-      dockerfile: Dockerfile
-      args:
-        TARGETPLATFORM: ${TARGETPLATFORM:-linux/amd64}
+      image: hyperagi/browser-use-web-ui
     ports:
       - "7788:7788"
       - "6080:6080"
