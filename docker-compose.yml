@@ -10,7 +10,7 @@ services:
       - "5901:5901"
       - "9222:9222"
     environment:
-      # LLM API Keys & Endpoints
+      # LLM API Keys & Endpoints 1
       - OPENAI_ENDPOINT=${OPENAI_ENDPOINT:-https://api.openai.com/v1}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - ANTHROPIC_ENDPOINT=${ANTHROPIC_ENDPOINT:-https://api.anthropic.com}
