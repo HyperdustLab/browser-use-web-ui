@@ -89,11 +89,11 @@ RUN playwright install chromium --with-deps
 # Copy the application code
 COPY . .
 
-# Set up supervisor configuration
-RUN mkdir -p /var/log/supervisor
-COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
+# Create tmp directory for http_run.py
+RUN mkdir -p /app/tmp
 
-EXPOSE 7788 6080 5901 9222
+# Expose ports: 7788 (webui), 6080 (novnc), 5901 (vnc), 9222 (debug), 9000 (http_run.py API)
+EXPOSE 7788 6080 5901 9222 9000
 
-CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf"]
-#CMD ["/bin/bash"]
+# Use http_run.py instead of supervisord
+CMD ["python", "http_run.py"]
