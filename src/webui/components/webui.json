@@ -1,0 +1,5 @@
+{
+  "cdp_URP": "",
+  "llm_model_name": "gpt-4o-mini",
+  "llm_base_url": "https://api.openai-proxy.org/v1"
+}

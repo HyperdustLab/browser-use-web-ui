@@ -10,11 +10,11 @@ import threading
 import subprocess
 from typing import Optional, List, Awaitable
 
-# 可选：使用 psutil 更稳（不存在也没关系）
+# Optional: Using psutil is more stable (it's okay if not present)
 try:
     import psutil  # type: ignore
 except Exception:
-    psutil = None  # noqa
+    psutil = None
 
 from pydantic import BaseModel
 from fastapi import FastAPI, HTTPException
@@ -27,94 +27,103 @@ import urllib.error
 import logging
 
 # -----------------------------
-# 日志：提升到 DEBUG，统一格式
+# Logging
 # -----------------------------
 LOG_FMT = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
 logging.basicConfig(
     level=logging.DEBUG,
     format=LOG_FMT,
     handlers=[logging.StreamHandler(sys.stdout)],
-    force=True,  # 覆盖任何已有配置
+    force=True,
 )
 logger = logging.getLogger("http_run")
 
-# === 基础路径 ===
+# === Base paths ===
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SRC_PATH = os.path.join(BASE_DIR, "src")
 sys.path.insert(0, SRC_PATH)
-logger.debug(f"BASE_DIR={BASE_DIR}")
-logger.debug(f"SRC_PATH={SRC_PATH}")
 
-# ====== webui.json 路径（以 http_run.py 所在目录为基准）======
+# ====== Path to webui.json (relative to http_run.py) ======
 WEBUI_JSON_PATH = os.path.join(BASE_DIR, "src", "webui", "components", "webui.json")
-logger.debug(f"WEBUI_JSON_PATH={WEBUI_JSON_PATH}")
 
-# ====== webui.py 路径与解释器 ======
+# ====== Path to webui.py and interpreter ======
 WEBUI_SCRIPT_PATH = os.environ.get("WEBUI_SCRIPT_PATH", os.path.join(BASE_DIR, "webui.py"))
 PYTHON_EXE = os.environ.get("WEBUI_PYTHON", sys.executable)
-logger.debug(f"WEBUI_SCRIPT_PATH={WEBUI_SCRIPT_PATH}")
-logger.debug(f"PYTHON_EXE={PYTHON_EXE}")
 
-# ====== WebUI host/port（默认值，可被请求覆盖）======
+# ====== WebUI host/port (default values, can be overridden by requests) ======
 DEFAULT_WEBUI_HOST = os.environ.get("WEBUI_HOST", "127.0.0.1")
-DEFAULT_WEBUI_PORT = int(os.environ.get("WEBUI_PORT", "7788"))  # 与 webui.py 默认一致
-logger.debug(f"DEFAULT_WEBUI_HOST={DEFAULT_WEBUI_HOST}, DEFAULT_WEBUI_PORT={DEFAULT_WEBUI_PORT}")
+DEFAULT_WEBUI_PORT = int(os.environ.get("WEBUI_PORT", "7788"))  # Consistent with webui.py default
 
-# ====== 可选 pid 文件，便于管理由本脚本启动的 webui.py 实例 ======
+# ====== Optional pid file for managing webui.py instances started by this script ======
 PID_DIR = os.path.join(BASE_DIR, "tmp")
 PID_FILE = os.path.join(PID_DIR, "webui.pid")
-logger.debug(f"PID_FILE={PID_FILE}")
+
+# ====== Current WebUI and browser status ======
+CURRENT_HOST: Optional[str] = None
+CURRENT_PORT: Optional[int] = None
+CURRENT_BROWSER_NAME: Optional[str] = None
+CURRENT_BROWSER_CHANNEL: Optional[str] = None
+CURRENT_EXEC_PATH: Optional[str] = None
+CURRENT_CDP_URL: Optional[str] = None  # CDP URL for direct Playwright connection
+_current_lock = threading.Lock()
+
+# ====== Global Playwright state (reusing browser/page across requests) ======
+_pw_context_lock = asyncio.Lock()  # Serialize browser operations
+_playwright = None
+_browser = None
+_context = None
+_page = None
 
 # -----------------------------
-# 文件/端口/HTTP 工具
+# Utility functions
 # -----------------------------
 def ensure_dir_for(path: str):
     d = os.path.dirname(path)
     if d and not os.path.exists(d):
         os.makedirs(d, exist_ok=True)
-        logger.debug(f"Created directory: {d}")
 
-def write_or_update_webui_json(cdp_URP_value: Optional[str]):
+def write_or_update_webui_json(
+    cdp_URP_value: Optional[str],
+    llm_model_name: Optional[str] = None,
+    llm_base_url: Optional[str] = None,
+):
     """
-    将 cdp_URP 写入/更新到 WEBUI_JSON_PATH。
-    若 cdp_URP_value 为 None，则保持文件原样（如果存在）。
+    Write/update cdp_URP, llm_model_name, llm_base_url to WEBUI_JSON_PATH.
+    If parameter is None: keep original value; if empty string "": explicitly write empty string.
     """
-    logger.info("写入 webui.json ...")
+    logger.info("Writing to webui.json.")
     ensure_dir_for(WEBUI_JSON_PATH)
     data = {}
     if os.path.exists(WEBUI_JSON_PATH):
         try:
             with open(WEBUI_JSON_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            logger.debug(f"现有 webui.json 内容: {data}")
+            logger.debug(f"Existing webui.json content: {data}")
         except Exception as e:
-            logger.warning(f"读取 webui.json 失败，将覆盖写入: {e}")
+            logger.warning(f"Failed to read webui.json, will overwrite: {e}")
             data = {}
     if cdp_URP_value is not None:
         data["cdp_URP"] = cdp_URP_value
+    if llm_model_name is not None:
+        data["llm_model_name"] = llm_model_name
+    if llm_base_url is not None:
+        data["llm_base_url"] = llm_base_url
     with open(WEBUI_JSON_PATH, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
-    logger.info(f"webui.json 已写入: {data}")
+    logger.info(f"webui.json written: {data}")
 
 def is_port_free(host: str, port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(0.3)
-        res = s.connect_ex((host, port)) != 0
-        logger.debug(f"is_port_free({host}, {port}) -> {res}")
-        return res
+        return s.connect_ex((host, port)) != 0
 
 def find_free_port(host: str) -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind((host, 0))
-        free_port = s.getsockname()[1]
-        logger.debug(f"find_free_port({host}) -> {free_port}")
-        return free_port
+        return s.getsockname()[1]
 
 def wait_http_ok(url: str, timeout_s: float = 30.0, interval_s: float = 0.5) -> bool:
-    """
-    轮询 GET 根路径是否可达；打印失败原因，便于排查。
-    """
-    logger.info(f"[probe] 开始探活：{url} (timeout={timeout_s}s)")
+    logger.info(f"[probe] Starting health check: {url} (timeout={timeout_s}s)")
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         try:
@@ -123,36 +132,28 @@ def wait_http_ok(url: str, timeout_s: float = 30.0, interval_s: float = 0.5) -> 
                 if 200 <= resp.status < 500:
                     return True
         except urllib.error.HTTPError as e:
-            # 已有 HTTP 响应（例如 404）也算服务就绪
             logger.info(f"[probe] {url} -> HTTP {e.code} (OK)")
             return True
-        except Exception as e:
-            logger.debug(f"[probe] {url} not ready: {e.__class__.__name__}: {e}")
+        except Exception:
+            pass
         time.sleep(interval_s)
-    logger.warning(f"[probe] 超时：{url} 仍未就绪")
+    logger.warning(f"[probe] Timeout: {url} not ready")
     return False
 
 # -----------------------------
-# 进程管理：查杀 webui.py
+# Process management: Kill webui.py
 # -----------------------------
 def _kill_pid(pid: int, force: bool = False):
-    logger.debug(f"_kill_pid(pid={pid}, force={force})")
     if psutil:
         try:
             p = psutil.Process(pid)
-            if force:
-                p.kill()
-            else:
-                p.terminate()
+            (p.kill() if force else p.terminate())
             try:
                 p.wait(timeout=3)
-                logger.debug(f"PID {pid} 已结束")
             except Exception:
-                if not force:
-                    logger.debug(f"PID {pid} 超时未结束，执行 kill")
-                    p.kill()
-        except Exception as e:
-            logger.debug(f"结束 PID {pid} 异常: {e}")
+                p.kill()
+        except Exception:
+            pass
     else:
         try:
             if os.name == "nt":
@@ -163,84 +164,63 @@ def _kill_pid(pid: int, force: bool = False):
                 os.kill(pid, signal.SIGTERM)
                 time.sleep(0.5)
                 os.kill(pid, signal.SIGKILL)
-            logger.debug(f"PID {pid} 已结束（非 psutil）")
-        except Exception as e:
-            logger.debug(f"结束 PID {pid} 异常（非 psutil）: {e}")
+        except Exception:
+            pass
 
 def _pids_listening_on_port(port: int) -> List[int]:
-    logger.debug(f"_pids_listening_on_port({port})")
     pids = []
     if psutil:
         try:
             for c in psutil.net_connections(kind="inet"):
                 if c.laddr and c.laddr.port == port and c.status == psutil.CONN_LISTEN and c.pid:
                     pids.append(c.pid)
-        except Exception as e:
-            logger.debug(f"net_connections 枚举异常: {e}")
+        except Exception:
+            pass
     else:
-        # Windows: netstat -ano | findstr :<port>
         try:
             if os.name == "nt":
                 out = subprocess.check_output(["netstat", "-ano"], text=True, creationflags=subprocess.CREATE_NO_WINDOW)
                 for line in out.splitlines():
                     if f":{port} " in line and "LISTENING" in line:
                         parts = line.split()
-                        pid = int(parts[-1])
-                        pids.append(pid)
-        except Exception as e:
-            logger.debug(f"netstat 枚举异常: {e}")
-    pids = list(sorted(set(pids)))
-    logger.debug(f"监听 {port} 的 PID 列表：{pids}")
-    return pids
+                        pids.append(int(parts[-1]))
+        except Exception:
+            pass
+    return list(sorted(set(pids)))
 
 def kill_existing_webui(host: str, port: int):
-    """
-    优先：pid 文件 → 命令行包含 webui.py → 监听端口的进程
-    """
-    logger.info("🛑 尝试停止已有 webui.py ...")
-    # 1) pid 文件
+    logger.info("🛑 Attempting to stop existing webui.py.")
     if os.path.exists(PID_FILE):
         try:
             with open(PID_FILE, "r", encoding="utf-8") as f:
                 pid = int(f.read().strip())
-            logger.debug(f"从 PID_FILE 读取 PID={pid}")
             _kill_pid(pid)
-        except Exception as e:
-            logger.debug(f"读取/结束 PID_FILE 失败: {e}")
-        try:
-            os.remove(PID_FILE)
-            logger.debug(f"已删除 PID_FILE: {PID_FILE}")
         except Exception:
             pass
-
-    # 2) 命令行包含 webui.py 的进程
+        try:
+            os.remove(PID_FILE)
+        except Exception:
+            pass
     if psutil:
         try:
             for p in psutil.process_iter(attrs=["pid", "name", "cmdline"]):
                 try:
                     cmdline = " ".join(p.info.get("cmdline") or [])
                     if "webui.py" in cmdline:
-                        logger.debug(f"结束命令行包含 webui.py 的 PID={p.info['pid']}")
                         _kill_pid(p.info["pid"])
                 except Exception:
                     continue
-        except Exception as e:
-            logger.debug(f"遍历进程异常: {e}")
-
-    # 3) 按端口杀
+        except Exception:
+            pass
     for pid in _pids_listening_on_port(port):
-        logger.debug(f"结束监听 {port} 的 PID={pid}")
         _kill_pid(pid, force=True)
-
-    # 等端口释放
-    for _ in range(20):  # 最多等 4 秒
+    for _ in range(20):  # Wait up to 4 seconds
         if is_port_free(host, port):
-            logger.debug(f"端口 {port} 已释放")
             break
         time.sleep(0.2)
 
 # -----------------------------
-# 子进程日志转发（避免 PIPE 卡住 + 方便排查）
+# Subprocess output handling
 # -----------------------------
 def _pump_output(proc: subprocess.Popen, prefix: str):
     def _reader(stream):
@@ -257,283 +237,526 @@ def _pump_output(proc: subprocess.Popen, prefix: str):
 def _watch_exit(proc: subprocess.Popen, label: str):
     def _waiter():
         code = proc.wait()
-        logger.warning(f"{label} 退出，returncode={code}")
+        logger.warning(f"{label} exited with returncode={code}")
     threading.Thread(target=_waiter, daemon=True).start()
 
 # -----------------------------
-# 拉起 webui.py（用 argparse 的 --ip/--port）
+# Launch webui.py
 # -----------------------------
-def launch_webui_process(host: str, port: int) -> subprocess.Popen:
+def launch_webui_process(host: str, port: int):
     chosen_port = port
     if not is_port_free(host, chosen_port):
-        logger.warning(f"端口 {chosen_port} 被占用，自动选择空闲端口")
+        logger.warning(f"Port {chosen_port} is occupied, automatically selecting a free port")
         chosen_port = find_free_port(host)
 
     ensure_dir_for(PID_FILE)
-
-    # 环境变量：强制无缓冲，确保日志实时输出
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
 
-    # 注意：不要 DETACHED_PROCESS，否则没有控制台输出也不易调试
-    creationflags = 0
+    # ✅ Read llm_base_url from webui.json → inject into subprocess's OLLAMA_HOST
+    try:
+        if os.path.exists(WEBUI_JSON_PATH):
+            with open(WEBUI_JSON_PATH, "r", encoding="utf-8") as f:
+                _cfg = json.load(f)
+            _ollama = (_cfg.get("llm_base_url") or "").strip()
+            if _ollama.endswith("/"):
+                _ollama = _ollama[:-1]
+            # Remove '/v1' suffix if mistakenly included
+            for _sfx in ("/v1", "/v1/"):
+                if _ollama.endswith(_sfx):
+                    _ollama = _ollama[: -len(_sfx)]
+            if _ollama:
+                env["OLLAMA_HOST"] = _ollama
+                logger.info(f"Set OLLAMA_HOST={env['OLLAMA_HOST']} for subprocess")
+        else:
+            logger.info(f"webui.json not found ({WEBUI_JSON_PATH}), skipping OLLAMA_HOST injection")
+    except Exception as e:
+        logger.warning(f"Failed to read webui.json to set OLLAMA_HOST: {e}")
 
     cmd = [PYTHON_EXE, WEBUI_SCRIPT_PATH, "--ip", host, "--port", str(chosen_port)]
-    logger.info("🚀 启动 webui.py：%s", " ".join(cmd))
-    logger.debug(f"cwd={BASE_DIR}")
+    logger.info("🚀 Launching webui.py: %s", " ".join(cmd))
     proc = subprocess.Popen(
-        cmd,
-        cwd=BASE_DIR,
-        stdout=subprocess.PIPE,         # ← 用线程实时消费
-        stderr=subprocess.STDOUT,
-        env=env,
-        creationflags=creationflags
+        cmd, cwd=BASE_DIR,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        env=env, creationflags=0
     )
     _pump_output(proc, "[webui.py] ")
     _watch_exit(proc, "webui.py")
 
-    # 记录 pid
     try:
         with open(PID_FILE, "w", encoding="utf-8") as f:
             f.write(str(proc.pid))
-        logger.debug(f"写入 PID_FILE={PID_FILE}, pid={proc.pid}")
-    except Exception as e:
-        logger.debug(f"写 PID_FILE 失败: {e}")
+    except Exception:
+        pass
 
-    # 探活（根地址）
     root_url = f"http://{host}:{chosen_port}/"
     ok = wait_http_ok(root_url, timeout_s=30.0, interval_s=0.5)
-    if not ok:
-        logger.warning("webui.py 探活未成功（端口可能稍后才就绪），稍后 Playwright 还会再试。")
+    if ok:
+        logger.info("webui.py health check successful: %s", root_url)
     else:
-        logger.info("webui.py 探活成功：%s", root_url)
+        logger.warning("webui.py health check not successful (may become ready later)")
+
+    global CURRENT_HOST, CURRENT_PORT
+    with _current_lock:
+        CURRENT_HOST, CURRENT_PORT = host, chosen_port
+
     return proc, chosen_port
 
 # -----------------------------
-# Playwright 任务（参数化）
+# Playwright: Launch/connect to browser & submit task
 # -----------------------------
-async def control_ui(
-    task_text: str,
+async def _open_fresh_browser_and_submit(
     webui_url: str,
+    task_text: str,
     run_tab_selectors: Optional[List[str]] = None,
-    submit_button_text: str = "Submit Task",
-    open_browser_headless: bool = False,
-    max_wait_ms: int = 10_000,
-    settle_delay_ms: int = 3_000,
+    headless: bool = False,
+    max_wait_ms: int = 15_000,
+    settle_delay_ms: int = 2_000,
+    browser_name: str = "chromium",
+    browser_channel: Optional[str] = None,
+    executable_path: Optional[str] = None,
+    browser_cdp_url: Optional[str] = None,  # Connect to external browser via CDP if provided
 ):
     """
-    通过 Playwright 操作 WebUI：
-    - 打开 WebUI
-    - 切到“Run Agent”标签（用多个 Selector 兜底）
-    - 填写第一个 textarea
-    - 点击 “Submit Task” 按钮
+    - If browser_cdp_url is provided: Prefer connecting to external browser via CDP
+    - Otherwise: Launch specified engine (chromium|firefox|webkit); chromium supports channel/executable_path
+    - Open WebUI → Click Run Agent → Find visible textarea → Fill in → Click Submit Task
+    - ⚠️ Do not close browser, keep for Pause/Resume
+    - ✅ If using browser_cdp_url: Close extra tabs after task submission, keep only current one
     """
-    logger.info(f"Playwright 将连接：{webui_url}")
-    run_tab_selectors = run_tab_selectors or [
+    global _playwright, _browser, _context, _page
+    global CURRENT_BROWSER_NAME, CURRENT_BROWSER_CHANNEL, CURRENT_EXEC_PATH, CURRENT_CDP_URL
+
+    # Close existing browser if any (before starting new task)
+    if _browser is not None:
+        try:
+            logger.info("Closing existing browser (before starting new task)...")
+            await _browser.close()
+        except Exception as e:
+            logger.warning(f"Error closing old browser: {e}")
+        finally:
+            _browser = _context = _page = None
+
+    if _playwright is None:
+        _playwright = await async_playwright().start()
+
+    # ---- 1) Connect to external browser via CDP (chromium only) ----
+    using_cdp = False
+    if browser_cdp_url:
+        logger.info(f"Connecting to external browser via CDP: {browser_cdp_url}")
+        try:
+            _browser = await _playwright.chromium.connect_over_cdp(browser_cdp_url)
+        except Exception as e:
+            raise RuntimeError(f"Failed to connect_over_cdp: {e}")
+        _context = _browser.contexts[0] if _browser.contexts else await _browser.new_context()
+        _page = await _context.new_page()
+        using_cdp = True
+        with _current_lock:
+            CURRENT_BROWSER_NAME = "chromium(cdp)"
+            CURRENT_BROWSER_CHANNEL = None
+            CURRENT_EXEC_PATH = None
+            CURRENT_CDP_URL = browser_cdp_url
+    else:
+        # ---- 2) Launch local browser normally ----
+        browser_name = (browser_name or "chromium").lower().strip()
+        if browser_name not in ("chromium", "firefox", "webkit"):
+            logger.warning(f"Unknown browser '{browser_name}', using chromium instead")
+            browser_name = "chromium"
+
+        engine = getattr(_playwright, browser_name)
+        launch_args = dict(headless=headless)
+
+        # Only chromium supports channel / executable_path
+        if browser_name == "chromium":
+            if executable_path:
+                ep = os.path.normpath(os.path.expandvars(os.path.expanduser(executable_path)))
+                if not os.path.isfile(ep):
+                    raise ValueError(
+                        f"executable_path does not exist: {ep}."
+                        "Please use double backslashes (C:\\\\path\\\\to\\\\chrome.exe) or forward slashes (C:/path/to/chrome.exe)."
+                    )
+                launch_args["executable_path"] = ep
+            elif browser_channel:
+                launch_args["channel"] = browser_channel
+        else:
+            if browser_channel:
+                logger.warning(f"{browser_name} does not support browser_channel, ignored")
+            if executable_path:
+                logger.warning(f"{browser_name} does not support executable_path, ignored")
+
+        logger.info(f"Launching browser: engine={browser_name}, args={ {k:v for k,v in launch_args.items() if v} }")
+        _browser = await engine.launch(**launch_args)
+        _context = await _browser.new_context()
+        _page = await _context.new_page()
+        with _current_lock:
+            CURRENT_BROWSER_NAME = browser_name
+            CURRENT_BROWSER_CHANNEL = browser_channel if browser_name == "chromium" else None
+            CURRENT_EXEC_PATH = launch_args.get("executable_path")
+            CURRENT_CDP_URL = None
+
+    logger.info(f"🌐 Opening WebUI page: {webui_url}")
+    await _page.goto(webui_url, wait_until="domcontentloaded")
+
+    # Click Run Agent tab (non-fatal if fails, might already be on the page)
+    selectors = run_tab_selectors or [
         "#component-82-button",
         "button:has-text('Run Agent')",
         "[id*='component'][id$='-button']:has-text('Run Agent')",
+        "role=button[name='Run Agent']",
     ]
+    if settle_delay_ms > 0:
+        await asyncio.sleep(settle_delay_ms / 1000.0)
 
-    logger.debug("等待 WebUI 就绪（Playwright）...")
-    time.sleep(1.0)
-
-    async with async_playwright() as p:
-        logger.debug("启动 Chromium（headless=%s）", open_browser_headless)
-        browser = await p.chromium.launch(headless=open_browser_headless)
-        context = await browser.new_context()
-        page = await context.new_page()
-
-        logger.info(f"🌐 打开 WebUI 页面: {webui_url}")
-        await page.goto(webui_url, wait_until="domcontentloaded")
-
-        if settle_delay_ms > 0:
-            logger.debug(f"点击 Run Agent 前等待 {settle_delay_ms} ms")
-            await asyncio.sleep(settle_delay_ms / 1000.0)
-
-        last_err = None
-        for sel in run_tab_selectors:
-            try:
-                logger.debug(f"尝试点击标签: {sel}")
-                await page.click(sel, timeout=max_wait_ms)
-                last_err = None
-                logger.debug("点击成功")
-                break
-            except (TimeoutError, PlaywrightTimeoutError) as e:
-                logger.debug(f"点击失败（{sel}）：{e}")
-                last_err = e
-            except Exception as e:
-                logger.debug(f"点击异常（{sel}）：{e}")
-                last_err = e
-
-        if last_err:
-            await browser.close()
-            raise RuntimeError(
-                f"未能点击到 'Run Agent' 标签，请检查 selector 列表: {run_tab_selectors}. err={last_err}"
-            )
-
-        logger.debug("等待 textarea 出现 ...")
-        await page.wait_for_selector("textarea", timeout=max_wait_ms)
-
-        logger.debug("填写任务内容 ...")
-        textareas = await page.query_selector_all("textarea")
-        if not textareas:
-            await browser.close()
-            raise RuntimeError("页面中没有找到任何 textarea。")
-        await textareas[0].fill(task_text)
-
-        logger.debug("点击提交按钮 ...")
+    for sel in selectors:
         try:
-            await page.click(f"button:has-text('{submit_button_text}')", timeout=max_wait_ms)
-        except Exception as e:
-            logger.debug(f"按文案点击失败：{e}，尝试点击第一个按钮")
-            buttons = await page.query_selector_all("button")
-            if not buttons:
-                await browser.close()
-                raise RuntimeError("页面中没有找到任何 button（无法点击提交）。")
-            await buttons[0].click()
+            logger.debug(f"Attempting to click tab: {sel}")
+            await _page.click(sel, timeout=4000)
+            break
+        except Exception:
+            pass
 
-        logger.info("✅ 任务已提交，等待 5 秒观察 ...")
-        await page.wait_for_timeout(5_000)
-        await browser.close()
+    # === Select visible textarea ===
+    try:
+        await _page.wait_for_selector("textarea", timeout=max_wait_ms, state="attached")
+    except Exception as e:
+        raise RuntimeError(f"No textarea found on page: {e}")
+
+    textareas = _page.locator("textarea")
+    count = await textareas.count()
+    target = None
+    for i in range(min(count, 25)):
+        handle = textareas.nth(i)
+        try:
+            if await handle.is_visible():
+                target = handle
+                break
+        except Exception:
+            continue
+    if target is None:
+        target = textareas.first
+    try:
+        await target.scroll_into_view_if_needed(timeout=3000)
+    except Exception:
+        pass
+
+    # Fill in task
+    try:
+        await target.fill(task_text, timeout=max_wait_ms)
+    except Exception:
+        try:
+            await target.click(timeout=3000)
+            await _page.keyboard.type(task_text, delay=20)
+        except Exception as e:
+            raise RuntimeError(f"Failed to fill task into textarea: {e}")
+
+    # Click Submit Task (prefer matching text; fallback: first visible button)
+    try:
+        await _page.click("button:has-text('Submit Task')", timeout=max_wait_ms)
+    except Exception:
+        buttons = _page.locator("button")
+        bcount = await buttons.count()
+        clicked = False
+        for i in range(min(bcount, 30)):
+            b = buttons.nth(i)
+            try:
+                if await b.is_visible():
+                    await b.click()
+                    clicked = True
+                    break
+            except Exception:
+                continue
+        if not clicked:
+            raise RuntimeError("No clickable button found on page (cannot submit task).")
+
+    logger.info("✅ Task submitted (browser remains open for Pause/Resume)")
+
+    # ✅ If using CDP connection: Close other tabs after submission, keep only current _page
+    if using_cdp:
+        try:
+            for ctx in list(_browser.contexts):
+                for pg in list(ctx.pages):
+                    try:
+                        if pg != _page and not pg.is_closed():
+                            await pg.close()
+                    except Exception:
+                        continue
+            logger.info("🔧 Closed extra tabs, keeping only current page.")
+        except Exception as e:
+            logger.warning(f"Failed to clean up extra tabs: {e}")
 
 # -----------------------------
-# 后台事件循环线程（用于跑异步任务）
+# Click button on current page (Pause/Resume)
+# -----------------------------
+async def _click_button_on_current_page(button_text: str, max_wait_ms: int = 10_000):
+    global _page
+    if _page is None:
+        raise RuntimeError("No connected browser page available; please Start first.")
+    await _page.click(f"button:has-text('{button_text}')", timeout=max_wait_ms)
+    logger.info(f"✅ Clicked button: {button_text}")
+
+# -----------------------------
+# Close browser (Stop)
+# -----------------------------
+async def _close_browser_if_any():
+    global _page, _context, _browser
+    if _browser is not None:
+        try:
+            logger.info("Closing browser...")
+            await _browser.close()
+        except Exception as e:
+            logger.warning(f"Error closing browser: {e}")
+    _page = _context = _browser = None
+
+# -----------------------------
+# Background event loop
 # -----------------------------
 class AsyncWorker:
-    """在独立线程中运行一个 asyncio 事件循环，并允许从主线程提交协程。"""
-
     def __init__(self):
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
-        logger.debug("AsyncWorker 事件循环线程已启动")
 
     def _run_loop(self):
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
-        logger.debug("AsyncWorker loop running forever ...")
         self.loop.run_forever()
 
     def submit_coro(self, coro: Awaitable):
-        """线程安全地提交协程，返回 concurrent.futures.Future"""
         if self.loop is None:
-            raise RuntimeError("AsyncWorker 的事件循环尚未就绪。")
-        logger.debug("提交协程到后台事件循环 ...")
+            raise RuntimeError("AsyncWorker event loop not ready.")
         return asyncio.run_coroutine_threadsafe(coro, self.loop)
 
 # -----------------------------
-# FastAPI 定义
+# FastAPI
 # -----------------------------
-app = FastAPI(title="UI Task Runner", version="1.8.0")
+app = FastAPI(title="UI Task Runner", version="2.6.0")
 worker = AsyncWorker()
 _task_lock = asyncio.Lock()
 _proc_lock = threading.Lock()
 
-class StartTaskReq(BaseModel):
-    task: str
-    # 写入 webui.json 的字段
-    cdp_URP: Optional[str] = None
-    # WebUI 参数（可选）
+class ActionReq(BaseModel):
+    Action: str                  # "Start" | "Pause" | "Resume" | "Stop"
+    task: Optional[str] = None   # Required for Start
+    cdp_URP: Optional[str] = None  # Write to webui.json (WebUI internal browser)
+    # ✅ New: Main LLM configuration (write to webui.json and inject as OLLAMA_HOST)
+    llm_model_name: Optional[str] = None
+    llm_base_url: Optional[str] = None
+
     host: Optional[str] = None
     port: Optional[int] = None
-    # Playwright 参数
     headless: Optional[bool] = False
     run_tab_selectors: Optional[List[str]] = None
-    submit_button_text: Optional[str] = "Submit Task"
-    max_wait_ms: Optional[int] = 10_000
-    settle_delay_ms: Optional[int] = 3_000
+    max_wait_ms: Optional[int] = 15_000
+    settle_delay_ms: Optional[int] = 2_000
 
-class StartTaskResp(BaseModel):
+    # External browser selection for accessing WebUI
+    browser: Optional[str] = "chromium"           # "chromium" | "firefox" | "webkit"
+    browser_channel: Optional[str] = None         # Only for chromium: "chrome" / "msedge"
+    executable_path: Optional[str] = None         # Only for chromium: path to browser executable
+
+    # ✨ Connect to external browser directly (your field name, double underscore)
+    browser_cdp__url: Optional[str] = None
+
+class ActionResp(BaseModel):
     status: str
     message: str
     webui_url: Optional[str] = None
     pid: Optional[int] = None
+    browser: Optional[str] = None
+    browser_channel: Optional[str] = None
+    executable_path: Optional[str] = None
+    browser_cdp__url: Optional[str] = None
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "script": WEBUI_SCRIPT_PATH, "json": WEBUI_JSON_PATH}
+    with _current_lock:
+        ch, cp = CURRENT_HOST, CURRENT_PORT
+        bn, bc, ep, cu = CURRENT_BROWSER_NAME, CURRENT_BROWSER_CHANNEL, CURRENT_EXEC_PATH, CURRENT_CDP_URL
+    return {
+        "status": "ok",
+        "script": WEBUI_SCRIPT_PATH,
+        "json": WEBUI_JSON_PATH,
+        "current_host": ch,
+        "current_port": cp,
+        "browser_open": bool(_browser is not None),
+        "browser": bn,
+        "browser_channel": bc,
+        "executable_path": ep,
+        "browser_cdp__url": cu,
+    }
 
 @app.get("/version")
 def version():
     return {"version": app.version}
 
-@app.post("/start", response_model=StartTaskResp)
-def start_task(req: StartTaskReq):
-    logger.info("收到 /start 请求")
-    logger.debug(f"请求体：{req.json()}")
-    if not req.task or not req.task.strip():
-        raise HTTPException(status_code=400, detail="task 不能为空")
+@app.post("/action", response_model=ActionResp)
+def handle_action(req: ActionReq):
+    action = (req.Action or "").strip().lower()
+    logger.info(f"Received /action: {action}")
+    logger.debug(f"Request body: {req.json()}")
 
-    host = (req.host or DEFAULT_WEBUI_HOST).strip()
-    try:
-        port = int(req.port) if req.port else DEFAULT_WEBUI_PORT
-    except Exception:
-        port = DEFAULT_WEBUI_PORT
-    logger.info(f"目标 WebUI: {host}:{port}")
+    if action not in ("start", "pause", "resume", "stop"):
+        raise HTTPException(status_code=400, detail=f"Unknown Action: {req.Action}")
 
-    # ① 停止已有 webui.py
-    try:
-        with _proc_lock:
-            kill_existing_webui(host, port)
-    except Exception as e:
-        logger.exception("停止 webui.py 失败")
-        raise HTTPException(status_code=500, detail=f"停止 webui.py 失败：{e}")
+    # ---------- Start ----------
+    if action == "start":
+        host = (req.host or DEFAULT_WEBUI_HOST).strip()
+        try:
+            port = int(req.port) if req.port else DEFAULT_WEBUI_PORT
+        except Exception:
+            port = DEFAULT_WEBUI_PORT
 
-    # ② 写 webui.json
-    try:
-        write_or_update_webui_json(req.cdp_URP)
-    except Exception as e:
-        logger.exception("写入 webui.json 失败")
-        raise HTTPException(status_code=500, detail=f"写入 webui.json 失败：{e}")
+        if not req.task or not req.task.strip():
+            raise HTTPException(status_code=400, detail="Start action requires a non-empty task")
 
-    # ③ 重新唤起 webui.py（传入 --ip/--port）
-    try:
-        with _proc_lock:
-            proc, real_port = launch_webui_process(host, port)
-            webui_url = f"http://{host}:{real_port}"
-    except Exception as e:
-        logger.exception("启动 webui.py 失败")
-        raise HTTPException(status_code=500, detail=f"启动 webui.py 失败：{e}")
+        async def _job_start():
+            async with _task_lock:
+                # Close old browser (before starting new task)
+                await _close_browser_if_any()
 
-    # ④ Playwright 控制（异步执行）
-    async def _job():
-        async with _task_lock:
-            await control_ui(
-                task_text=req.task.strip(),
+                # Kill old webui
+                def _stop_proc():
+                    with _proc_lock:
+                        kill_existing_webui(host, port)
+                await asyncio.get_event_loop().run_in_executor(None, _stop_proc)
+
+                # Write to json (WebUI internal browser + LLM configuration)
+                write_or_update_webui_json(
+                    req.cdp_URP,
+                    llm_model_name=req.llm_model_name,
+                    llm_base_url=req.llm_base_url,
+                )
+
+                # Start webui
+                def _start_proc():
+                    with _proc_lock:
+                        return launch_webui_process(host, port)
+                proc, real_port = await asyncio.get_event_loop().run_in_executor(None, _start_proc)
+                webui_url = f"http://{host}:{real_port}"
+
+                # Open browser and submit (keep browser open)
+                await _open_fresh_browser_and_submit(
+                    webui_url=webui_url,
+                    task_text=req.task.strip(),
+                    run_tab_selectors=req.run_tab_selectors,
+                    headless=bool(req.headless),
+                    max_wait_ms=int(req.max_wait_ms or 15000),
+                    settle_delay_ms=int(req.settle_delay_ms or 2000),
+                    browser_name=(req.browser or "chromium"),
+                    browser_channel=req.browser_channel,
+                    executable_path=req.executable_path,
+                    browser_cdp_url=req.browser_cdp__url,  # When using CDP, tabs will be consolidated to one after submission
+                )
+
+                with _current_lock:
+                    bn, bc, ep, cu = CURRENT_BROWSER_NAME, CURRENT_BROWSER_CHANNEL, CURRENT_EXEC_PATH, CURRENT_CDP_URL
+
+                return webui_url, proc.pid, bn, bc, ep, cu
+
+        try:
+            fut = worker.submit_coro(_job_start())
+            webui_url, pid, bn, bc, ep, cu = fut.result()
+            msg = f"Start accepted, WebUI: {webui_url}. Browser remains open (engine={bn}"
+            if bc:
+                msg += f", channel={bc}"
+            if ep:
+                msg += f", exec={ep}"
+            if cu:
+                msg += f", cdp={cu}"
+            msg += ")."
+            if req.cdp_URP is not None:
+                msg += f" Updated cdp_URP in {WEBUI_JSON_PATH}."
+            if req.llm_model_name is not None:
+                msg += f" Updated llm_model_name={req.llm_model_name}."
+            if req.llm_base_url is not None:
+                msg += f" Updated llm_base_url={req.llm_base_url}."
+            return ActionResp(
+                status="accepted",
+                message=msg,
                 webui_url=webui_url,
-                run_tab_selectors=req.run_tab_selectors,
-                submit_button_text=req.submit_button_text or "Submit Task",
-                open_browser_headless=bool(req.headless),
-                max_wait_ms=int(req.max_wait_ms or 10_000),
-                settle_delay_ms=int(req.settle_delay_ms or 3_000),
+                pid=pid,
+                browser=bn,
+                browser_channel=bc,
+                executable_path=ep,
+                browser_cdp__url=cu,
             )
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.exception("Start execution failed")
+            raise HTTPException(status_code=500, detail=f"Start execution failed: {e}")
 
-    try:
-        worker.submit_coro(_job())
-        msg = f"任务已提交并在后台执行（WebUI: {webui_url}）。"
-        if req.cdp_URP is not None:
-            msg += f" 已更新 {WEBUI_JSON_PATH} 的 cdp_URP。"
-        logger.info(msg)
-        return StartTaskResp(status="accepted", message=msg, webui_url=webui_url, pid=proc.pid)
-    except Exception as e:
-        logger.exception("提交任务失败")
-        raise HTTPException(status_code=500, detail=f"提交任务失败：{e}")
+    # ---------- Pause / Resume ----------
+    if action in ("pause", "resume"):
+        btn = "Pause" if action == "pause" else "Resume"
+
+        async def _job_click():
+            async with _task_lock:
+                await _click_button_on_current_page(button_text=btn)
+
+        try:
+            fut = worker.submit_coro(_job_click())
+            fut.result()
+            with _current_lock:
+                ch, cp = CURRENT_HOST, CURRENT_PORT
+                bn, bc, ep, cu = CURRENT_BROWSER_NAME, CURRENT_BROWSER_CHANNEL, CURRENT_EXEC_PATH, CURRENT_CDP_URL
+            webui_url = f"http://{ch or DEFAULT_WEBUI_HOST}:{cp or DEFAULT_WEBUI_PORT}"
+            msg = f"{req.Action} accepted (clicked {btn} on current page)."
+            return ActionResp(
+                status="accepted",
+                message=msg,
+                webui_url=webui_url,
+                browser=bn,
+                browser_channel=bc,
+                executable_path=ep,
+                browser_cdp__url=cu,
+            )
+        except RuntimeError as e:
+            raise HTTPException(status_code=409, detail=f"{req.Action} failed: {e}")
+        except Exception as e:
+            logger.exception(f"{req.Action} execution failed")
+            raise HTTPException(status_code=500, detail=f"{req.Action} execution failed: {e}")
+
+    # ---------- Stop ----------
+    if action == "stop":
+        with _current_lock:
+            ch, cp = CURRENT_HOST, CURRENT_PORT
+        host = (req.host or ch or DEFAULT_WEBUI_HOST).strip()
+        try:
+            port = int(req.port) if req.port else (cp or DEFAULT_WEBUI_PORT)
+        except Exception:
+            port = cp or DEFAULT_WEBUI_PORT
+
+        async def _job_stop():
+            async with _task_lock:
+                await _close_browser_if_any()
+                def _stop_proc():
+                    with _proc_lock:
+                        kill_existing_webui(host, port)
+                await asyncio.get_event_loop().run_in_executor(None, _stop_proc)
+                global CURRENT_HOST, CURRENT_PORT, CURRENT_BROWSER_NAME, CURRENT_BROWSER_CHANNEL, CURRENT_EXEC_PATH, CURRENT_CDP_URL
+                with _current_lock:
+                    CURRENT_HOST = CURRENT_PORT = None
+                    CURRENT_BROWSER_NAME = CURRENT_BROWSER_CHANNEL = CURRENT_EXEC_PATH = CURRENT_CDP_URL = None
+
+        try:
+            fut = worker.submit_coro(_job_stop())
+            fut.result()
+            return ActionResp(status="ok", message="Stop completed: closed browser and terminated webui.py.")
+        except Exception as e:
+            logger.exception("Stop execution failed")
+            raise HTTPException(status_code=500, detail=f"Stop execution failed: {e}")
+
+    raise HTTPException(status_code=400, detail=f"Unknown Action: {req.Action}")
 
 # -----------------------------
-# 入口：仅启动 API（不启动 WebUI）
+# Entry point: Start API only (do not start WebUI)
 # -----------------------------
 def start_api_server(host: str = None, port: int = None):
     api_host = host or os.environ.get("API_HOST", "0.0.0.0")
     api_port = int(port or os.environ.get("API_PORT", "9000"))
-    logger.info(f"🛰️ 启动 API 服务：http://{api_host}:{api_port}")
-    uvicorn.run(
-        app,
-        host=api_host,
-        port=api_port,
-        log_level="debug",  # 让 uvicorn 走 DEBUG
-    )
+    logger.info(f"🛰️ Starting API server: http://{api_host}:{api_port}")
+    uvicorn.run(app, host=api_host, port=api_port, log_level="debug")
 
 if __name__ == "__main__":
-    # 这里只启动 API，按请求去：杀 webui.py → 写 JSON → 启 webui.py（--ip/--port）→ Playwright 控制
     start_api_server()

@@ -1,16 +1,59 @@
 import json
 import os
+import logging
+from functools import partial
+from typing import Any, Dict, Optional
 
 import gradio as gr
 from gradio.components import Component
-from typing import Any, Dict, Optional
+
 from src.webui.webui_manager import WebuiManager
 from src.utils import config
-import logging
-from functools import partial
 
 logger = logging.getLogger(__name__)
 
+# =========================
+# webui.json path and loading function
+# =========================
+
+# Fixed default path for webui.json (in the same directory as this file)
+DEFAULT_WEBUI_JSON_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "webui.json"
+)
+# If the environment variable WEBUI_JSON_PATH is set, use it first
+WEBUI_JSON_PATH = os.getenv("WEBUI_JSON_PATH", DEFAULT_WEBUI_JSON_PATH)
+
+
+def load_llm_settings_from_webui_json() -> (Optional[str], Optional[str]):
+    """
+    Load llm_model_name and llm_base_url from webui.json.
+    - Returns (model_name, base_url)
+    - Returns corresponding None values if file doesn't exist or fields are missing
+    """
+    model_name = None
+    base_url = None
+    path = WEBUI_JSON_PATH
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            model_name = cfg.get("llm_model_name")
+            base_url = cfg.get("llm_base_url")
+            logger.info(
+                f"[agent_settings_tab] Loaded LLM configuration from {path}: "
+                f"llm_model_name={model_name}, llm_base_url={base_url}"
+            )
+        else:
+            logger.info(f"[agent_settings_tab] webui.json not found: {path}")
+    except Exception as e:
+        logger.warning(f"[agent_settings_tab] Error reading {path}: {e}")
+
+    return model_name, base_url
+
+
+# =========================
+# Other existing logic
+# =========================
 
 def update_model_dropdown(llm_provider):
     """
@@ -18,10 +61,18 @@ def update_model_dropdown(llm_provider):
     """
     # Use predefined models for the selected provider
     if llm_provider in config.model_names:
-        return gr.Dropdown(choices=config.model_names[llm_provider], value=config.model_names[llm_provider][0],
-                           interactive=True)
+        return gr.Dropdown(
+            choices=config.model_names[llm_provider],
+            value=config.model_names[llm_provider][0],
+            interactive=True
+        )
     else:
-        return gr.Dropdown(choices=[], value="", interactive=True, allow_custom_value=True)
+        return gr.Dropdown(
+            choices=[],
+            value="",
+            interactive=True,
+            allow_custom_value=True
+        )
 
 
 async def update_mcp_server(mcp_file: str, webui_manager: WebuiManager):
@@ -50,28 +101,51 @@ def create_agent_settings_tab(webui_manager: WebuiManager):
     input_components = set(webui_manager.get_components())
     tab_components = {}
 
-    with gr.Group():
-        with gr.Column():
-            override_system_prompt = gr.Textbox(label="Override system prompt", lines=4, interactive=True)
-            extend_system_prompt = gr.Textbox(label="Extend system prompt", lines=4, interactive=True)
+    # === Load default LLM configuration from webui.json ===
+    llm_model_default, llm_base_url_default = load_llm_settings_from_webui_json()
+
+    # Set initial value and dropdown options for Provider
+    initial_provider = "openai"
+    initial_choices = config.model_names.get(initial_provider, [])
+    # Model initial value priority: webui.json > first preset of provider > empty string
+    initial_model_value = (
+        llm_model_default if llm_model_default
+        else (initial_choices[0] if initial_choices else "")
+    )
+    # Base URL initial value priority: webui.json > original default
+    initial_base_url_value = llm_base_url_default or "https://api.openai-proxy.org/v1"
 
     with gr.Group():
-        mcp_json_file = gr.File(label="MCP server json", interactive=True, file_types=[".json"])
-        mcp_server_config = gr.Textbox(label="MCP server", lines=6, interactive=True, visible=False)
+        with gr.Column():
+            override_system_prompt = gr.Textbox(
+                label="Override system prompt", lines=4, interactive=True
+            )
+            extend_system_prompt = gr.Textbox(
+                label="Extend system prompt", lines=4, interactive=True
+            )
+
+    with gr.Group():
+        mcp_json_file = gr.File(
+            label="MCP server json", interactive=True, file_types=[".json"]
+        )
+        mcp_server_config = gr.Textbox(
+            label="MCP server", lines=6, interactive=True, visible=False
+        )
 
     with gr.Group():
         with gr.Row():
             llm_provider = gr.Dropdown(
                 choices=[provider for provider, model in config.model_names.items()],
                 label="LLM Provider",
-                value="openai",
+                value=initial_provider,
                 info="Select LLM provider for LLM",
                 interactive=True
             )
             llm_model_name = gr.Dropdown(
                 label="LLM Model Name",
-                choices=config.model_names["ollama"],
-                value="gpt-4o-mini",
+                # Provide choices based on initial_provider initially
+                choices=initial_choices,
+                value=initial_model_value,
                 interactive=True,
                 allow_custom_value=True,
                 info="Select a model in the dropdown options or directly type a custom model name"
@@ -95,8 +169,8 @@ def create_agent_settings_tab(webui_manager: WebuiManager):
             )
 
             ollama_num_ctx = gr.Slider(
-                minimum=2 ** 8,
-                maximum=2 ** 16,
+                minimum=2 **8,
+                maximum=2** 16,
                 value=16000,
                 step=1,
                 label="Ollama Context Length",
@@ -108,13 +182,13 @@ def create_agent_settings_tab(webui_manager: WebuiManager):
         with gr.Row():
             llm_base_url = gr.Textbox(
                 label="Base URL",
-                value="https://api.openai-proxy.org/v1",
+                value=initial_base_url_value,
                 info="API endpoint URL (if required)"
             )
             llm_api_key = gr.Textbox(
                 label="API Key",
                 type="password",
-                value="sk-NQl0lA710pUeCP6WaknqnXSvR0Ee8YRhQpON3ydKp8uZTiq5",
+                value="sk-NQl0lA710pUeCP6WaknqnXSvR0Ee8YRhQpON3ydKp8uZTiq5",  # No longer preset any API key
                 info="Your API key (leave blank to use .env)"
             )
 
@@ -152,8 +226,8 @@ def create_agent_settings_tab(webui_manager: WebuiManager):
             )
 
             planner_ollama_num_ctx = gr.Slider(
-                minimum=2 ** 8,
-                maximum=2 ** 16,
+                minimum=2 **8,
+                maximum=2** 16,
                 value=16000,
                 step=1,
                 label="Ollama Context Length",
@@ -210,6 +284,7 @@ def create_agent_settings_tab(webui_manager: WebuiManager):
             choices=['function_calling', 'json_mode', 'raw', 'auto', 'tools', "None"],
             visible=True
         )
+
     tab_components.update(dict(
         override_system_prompt=override_system_prompt,
         extend_system_prompt=extend_system_prompt,
@@ -236,6 +311,7 @@ def create_agent_settings_tab(webui_manager: WebuiManager):
     ))
     webui_manager.add_components("agent_settings", tab_components)
 
+    # === Interaction logic remains unchanged ===
     llm_provider.change(
         fn=lambda x: gr.update(visible=x == "ollama"),
         inputs=llm_provider,
