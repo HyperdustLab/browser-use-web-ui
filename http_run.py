@@ -58,6 +58,9 @@ DEFAULT_WEBUI_PORT = int(os.environ.get("WEBUI_PORT", "7788"))  # Consistent wit
 PID_DIR = os.path.join(BASE_DIR, "tmp")
 PID_FILE = os.path.join(PID_DIR, "webui.pid")
 
+# ✅ 保存 webui.py 子进程对象，便于在 Resume 时向 stdin 发送回车
+WEBUI_PROC: Optional[subprocess.Popen] = None
+
 # ====== Current WebUI and browser status ======
 CURRENT_HOST: Optional[str] = None
 CURRENT_PORT: Optional[int] = None
@@ -241,6 +244,28 @@ def _watch_exit(proc: subprocess.Popen, label: str):
     threading.Thread(target=_waiter, daemon=True).start()
 
 # -----------------------------
+# 向 webui.py 进程发送“回车”
+# -----------------------------
+def send_enter_to_webui() -> bool:
+    """Write a newline to webui.py stdin to simulate pressing Enter in CLI."""
+    global WEBUI_PROC
+    if WEBUI_PROC is None:
+        logger.warning("send_enter_to_webui: WEBUI_PROC is None (webui not started by this process).")
+        return False
+    try:
+        if WEBUI_PROC.stdin:
+            WEBUI_PROC.stdin.write(b"\n")
+            WEBUI_PROC.stdin.flush()
+            logger.info("▶️  Sent ENTER to webui.py stdin.")
+            return True
+        else:
+            logger.warning("send_enter_to_webui: WEBUI_PROC.stdin is None.")
+            return False
+    except Exception as e:
+        logger.exception(f"send_enter_to_webui failed: {e}")
+        return False
+
+# -----------------------------
 # Launch webui.py
 # -----------------------------
 def launch_webui_process(host: str, port: int):
@@ -276,10 +301,19 @@ def launch_webui_process(host: str, port: int):
     cmd = [PYTHON_EXE, WEBUI_SCRIPT_PATH, "--ip", host, "--port", str(chosen_port)]
     logger.info("🚀 Launching webui.py: %s", " ".join(cmd))
     proc = subprocess.Popen(
-        cmd, cwd=BASE_DIR,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        env=env, creationflags=0
+        cmd,
+        cwd=BASE_DIR,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        stdin=subprocess.PIPE,          # ✅ 打开 stdin，便于后续 send_enter_to_webui()
+        env=env,
+        creationflags=0
     )
+
+    # ✅ 保存到全局，供 Resume 时写入回车
+    global WEBUI_PROC
+    WEBUI_PROC = proc
+
     _pump_output(proc, "[webui.py] ")
     _watch_exit(proc, "webui.py")
 
@@ -322,7 +356,7 @@ async def _open_fresh_browser_and_submit(
     - Otherwise: Launch specified engine (chromium|firefox|webkit); chromium supports channel/executable_path
     - Open WebUI → Click Run Agent → Find visible textarea → Fill in → Click Submit Task
     - ⚠️ Do not close browser, keep for Pause/Resume
-    - ✅ If using browser_cdp_url: Close extra tabs after task submission, keep only current one
+    - ✅ If using browser_cdp_url: Close other tabs after task submission, keep only current one
     """
     global _playwright, _browser, _context, _page
     global CURRENT_BROWSER_NAME, CURRENT_BROWSER_CHANNEL, CURRENT_EXEC_PATH, CURRENT_CDP_URL
@@ -529,7 +563,7 @@ class AsyncWorker:
 # -----------------------------
 # FastAPI
 # -----------------------------
-app = FastAPI(title="UI Task Runner", version="2.6.0")
+app = FastAPI(title="UI Task Runner", version="2.7.0")
 worker = AsyncWorker()
 _task_lock = asyncio.Lock()
 _proc_lock = threading.Lock()
@@ -538,7 +572,7 @@ class ActionReq(BaseModel):
     Action: str                  # "Start" | "Pause" | "Resume" | "Stop"
     task: Optional[str] = None   # Required for Start
     cdp_URP: Optional[str] = None  # Write to webui.json (WebUI internal browser)
-    # ✅ New: Main LLM configuration (write to webui.json and inject as OLLAMA_HOST)
+    # Main LLM configuration (write to webui.json and inject as OLLAMA_HOST)
     llm_model_name: Optional[str] = None
     llm_base_url: Optional[str] = None
 
@@ -554,7 +588,7 @@ class ActionReq(BaseModel):
     browser_channel: Optional[str] = None         # Only for chromium: "chrome" / "msedge"
     executable_path: Optional[str] = None         # Only for chromium: path to browser executable
 
-    # ✨ Connect to external browser directly (your field name, double underscore)
+    # Connect to external browser directly (your field name, double underscore)
     browser_cdp__url: Optional[str] = None
 
 class ActionResp(BaseModel):
@@ -695,13 +729,24 @@ def handle_action(req: ActionReq):
                 await _click_button_on_current_page(button_text=btn)
 
         try:
+            # 先点击 UI 的 Pause/Resume
             fut = worker.submit_coro(_job_click())
             fut.result()
+
+            extra = ""
+            if action == "resume":
+                # ✅ 收到 Resume 后，按 0.2s 间隔向 CLI 连续发送 5 次回车
+                ok_any = False
+                for i in range(5):
+                    ok_any = send_enter_to_webui() or ok_any
+                    time.sleep(0.2)   # 200ms 间隔
+                extra = " Burst ENTER x5 to CLI." if ok_any else " (ENTER burst skipped or failed)."
+
             with _current_lock:
                 ch, cp = CURRENT_HOST, CURRENT_PORT
                 bn, bc, ep, cu = CURRENT_BROWSER_NAME, CURRENT_BROWSER_CHANNEL, CURRENT_EXEC_PATH, CURRENT_CDP_URL
             webui_url = f"http://{ch or DEFAULT_WEBUI_HOST}:{cp or DEFAULT_WEBUI_PORT}"
-            msg = f"{req.Action} accepted (clicked {btn} on current page)."
+            msg = f"{req.Action} accepted (clicked {btn} on current page).{extra}"
             return ActionResp(
                 status="accepted",
                 message=msg,
@@ -734,10 +779,12 @@ def handle_action(req: ActionReq):
                     with _proc_lock:
                         kill_existing_webui(host, port)
                 await asyncio.get_event_loop().run_in_executor(None, _stop_proc)
-                global CURRENT_HOST, CURRENT_PORT, CURRENT_BROWSER_NAME, CURRENT_BROWSER_CHANNEL, CURRENT_EXEC_PATH, CURRENT_CDP_URL
+                global CURRENT_HOST, CURRENT_PORT, CURRENT_BROWSER_NAME, CURRENT_BROWSER_CHANNEL, CURRENT_EXEC_PATH, CURRENT_CDP_URL, WEBUI_PROC
                 with _current_lock:
                     CURRENT_HOST = CURRENT_PORT = None
                     CURRENT_BROWSER_NAME = CURRENT_BROWSER_CHANNEL = CURRENT_EXEC_PATH = CURRENT_CDP_URL = None
+                # ✅ 清理进程句柄，防止脏引用
+                WEBUI_PROC = None
 
         try:
             fut = worker.submit_coro(_job_stop())
