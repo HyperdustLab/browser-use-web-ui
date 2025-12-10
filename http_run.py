@@ -60,7 +60,7 @@ DEFAULT_WEBUI_PORT = int(os.environ.get("WEBUI_PORT", "7788"))  # Keep in sync w
 # ====== Global Playwright state (shared between sessions) ======
 _playwright = None  # type: ignore
 
-# ====== Resume / Pause timing constants (per session uses same constants) ======
+# ====== Resume / Pause timing constants ======
 ENTER_PROMPT_SUBSTR = "Press [Enter] to resume"
 
 RESUME_WAIT_FOR_PROMPT_SECONDS = 2.0
@@ -171,7 +171,9 @@ def _kill_pid(pid: int, force: bool = False):
 class SessionState:
     session_id: str
     host: str
-    port: int
+    port: int                    # WebUI HTTP 端口
+    ws_port: Optional[int] = None  # WebUI WebSocket 端口（新增）
+
     webui_proc: Optional[subprocess.Popen] = None
 
     # Playwright browser state
@@ -289,12 +291,13 @@ def send_enter_to_webui(session: SessionState) -> bool:
         return False
 
 # -----------------------------
-# Launch webui.py for a session
+# Launch webui.py for a session（包含独立 WS 端口）
 # -----------------------------
 def launch_webui_process_for_session(session: SessionState):
     host = session.host
     port = session.port
 
+    # HTTP 端口
     chosen_port = port
     if not is_port_free(host, chosen_port):
         logger.warning(f"[{session.session_id}] Port {chosen_port} is occupied, automatically selecting a free port")
@@ -303,7 +306,12 @@ def launch_webui_process_for_session(session: SessionState):
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
 
-    # Read llm_base_url from webui.json → inject into child process OLLAMA_HOST (if OAI reverse proxy, automatically remove /v1)
+    # WebSocket 端口（为该 session 单独占一个）
+    ws_port = find_free_port(host)
+    env["WEBUI_WS_PORT"] = str(ws_port)
+    session.ws_port = ws_port
+
+    # 从 webui.json 中读取 llm_base_url → 注入 OLLAMA_HOST
     try:
         if os.path.exists(WEBUI_JSON_PATH):
             with open(WEBUI_JSON_PATH, "r", encoding="utf-8") as f:
@@ -350,99 +358,71 @@ def launch_webui_process_for_session(session: SessionState):
     return proc, chosen_port
 
 # -----------------------------
-# Playwright: Launch/connect browser & submit task (per session)
+# Playwright: Launch browser & submit task (per session)
 # -----------------------------
 async def _open_browser_and_submit_for_session(
     session: SessionState,
     webui_url: str,
     task_text: str,
-    run_tab_selectors: Optional[List[str]] = None,
     headless: bool = False,
-    max_wait_ms: int = 15_000,
-    settle_delay_ms: int = 2_000,
     browser_name: str = "chromium",
     browser_channel: Optional[str] = None,
     executable_path: Optional[str] = None,
-    browser_cdp_url: Optional[str] = None,
 ):
     """
     打开 WebUI、确保 Run Agent tab 被点开、找到任务输入框、输入任务、点击 Submit Task。
-    集成 use.py 的“任务输入框检测 + Run Agent 点击逻辑”，并补上浏览器启动逻辑。
+    整合 use.py 的逻辑，并在每个 session 中独立启动浏览器。
     """
     global _playwright
 
-    # 1) 启动 Playwright（全局一次）
+    # ---------- 启动 Playwright ----------
     if _playwright is None:
         _playwright = await async_playwright().start()
 
-    # 2) 为当前 session 启动/连接浏览器 + 创建 page
-    if session.browser is None:
-        # 2.1 CDP 外部浏览器
-        if browser_cdp_url:
-            logger.info(f"[{session.session_id}] Connecting to external browser via CDP: {browser_cdp_url}")
-            browser = await _playwright.chromium.connect_over_cdp(browser_cdp_url)
-            context = browser.contexts[0] if browser.contexts else await browser.new_context()
-            page = await context.new_page()
-            session.browser_name = "chromium(cdp)"
-            session.browser_channel = None
-            session.exec_path = None
-            session.cdp_url = browser_cdp_url
-        else:
-            # 2.2 本地启动浏览器
-            engine_name = (browser_name or "chromium").lower().strip()
-            if engine_name not in ("chromium", "firefox", "webkit"):
-                logger.warning(f"[{session.session_id}] Unknown browser '{engine_name}', fallback to chromium")
-                engine_name = "chromium"
-            engine = getattr(_playwright, engine_name)
-            launch_args: Dict[str, Any] = dict(headless=headless)
-            if engine_name == "chromium":
-                if executable_path:
-                    ep = os.path.normpath(os.path.expandvars(os.path.expanduser(executable_path)))
-                    if not os.path.isfile(ep):
-                        raise ValueError(f"executable_path does not exist: {ep}")
-                    launch_args["executable_path"] = ep
-                elif browser_channel:
-                    launch_args["channel"] = browser_channel
-            else:
-                if browser_channel:
-                    logger.warning(f"[{session.session_id}] {engine_name} does not support browser_channel, ignored")
-                if executable_path:
-                    logger.warning(f"[{session.session_id}] {engine_name} does not support executable_path, ignored")
+    bname = (browser_name or "chromium").lower().strip()
+    if bname not in ("chromium", "firefox", "webkit"):
+        logger.warning(f"[{session.session_id}] Unknown browser '{bname}', fallback to chromium")
+        bname = "chromium"
 
-            logger.info(f"[{session.session_id}] Launching browser: engine={engine_name}, args={ {k:v for k,v in launch_args.items() if v} }")
-            browser = await engine.launch(**launch_args)
-            context = await browser.new_context()
-            page = await context.new_page()
+    engine = getattr(_playwright, bname)
 
-            session.browser_name = engine_name
-            session.browser_channel = browser_channel if engine_name == "chromium" else None
-            session.exec_path = launch_args.get("executable_path")
-            session.cdp_url = None
+    launch_args: Dict[str, Any] = {"headless": bool(headless)}
+    if bname == "chromium":
+        if executable_path:
+            ep = os.path.normpath(os.path.expandvars(os.path.expanduser(executable_path)))
+            if not os.path.isfile(ep):
+                raise ValueError(f"executable_path does not exist: {ep}")
+            launch_args["executable_path"] = ep
+        elif browser_channel:
+            launch_args["channel"] = browser_channel
 
-        session.browser = browser
-        session.context = context
-        session.page = page
-    else:
-        page = session.page
+    logger.info(f"[{session.session_id}] Launching browser: engine={bname}, args={ {k: v for k, v in launch_args.items() if v not in (None, '')} }")
+    browser = await engine.launch(**launch_args)
+    context = await browser.new_context()
+    page = await context.new_page()
+
+    session.browser = browser
+    session.context = context
+    session.page = page
+    session.browser_name = bname
+    session.browser_channel = browser_channel if bname == "chromium" else None
+    session.exec_path = launch_args.get("executable_path")
+    session.cdp_url = None
 
     TASK_PLACEHOLDER = "Enter your task here or provide assistance when asked."
 
-    # 打开 URL
+    # ---------- 打开 WebUI ----------
     logger.info(f"[{session.session_id}] 🌐 Opening WebUI page: {webui_url}")
     await page.goto(webui_url)
-
-    # 等 WebUI 初步渲染
     try:
-        await page.wait_for_load_state("networkidle", timeout=max_wait_ms * 4)
+        await page.wait_for_load_state("networkidle", timeout=60000)
     except Exception:
         pass
-    await asyncio.sleep(settle_delay_ms / 1000.0)
+    await asyncio.sleep(2)
 
-    async def click_run_agent_once():
-        """
-        完全使用你“第一版 http_run.py”的 Run Agent 点击逻辑。
-        """
-        selectors = run_tab_selectors or [
+    # ---------- 点击 Run Agent ----------
+    async def click_run_agent_once() -> bool:
+        selectors = [
             "#component-82-button",
             "button:has-text('Run Agent')",
             "[id*='component'][id$='-button']:has-text('Run Agent')",
@@ -450,24 +430,21 @@ async def _open_browser_and_submit_for_session(
         ]
         for sel in selectors:
             try:
-                logger.debug(f"[{session.session_id}] Try click run agent: {sel}")
+                logger.debug(f"[{session.session_id}] Try click Run Agent: {sel}")
                 await page.click(sel, timeout=4000)
                 logger.info(f"[{session.session_id}] Clicked Run Agent via: {sel}")
                 return True
             except Exception as e:
-                logger.debug(f"[{session.session_id}] Selector failed: {sel}  err={e}")
+                logger.debug(f"[{session.session_id}] Selector failed: {sel} err={e}")
         return False
 
-    # ============================================================
-    # 循环等待任务输入框出现，如果没有就继续点 Run Agent
-    # ============================================================
+    # ---------- 循环：找任务输入框，没有就持续点 Run Agent ----------
     deadline = time.time() + 120
     task_textarea = None
 
     while time.time() < deadline:
         logger.debug(f"[{session.session_id}] Checking for task textarea...")
 
-        # 每轮检查任务输入框
         tas = page.locator(f"textarea[placeholder='{TASK_PLACEHOLDER}']")
         count_ta = await tas.count()
         visible_handle = None
@@ -486,7 +463,6 @@ async def _open_browser_and_submit_for_session(
             break
 
         logger.debug(f"[{session.session_id}] Task textarea not found, clicking Run Agent...")
-
         clicked = await click_run_agent_once()
         if clicked:
             logger.debug(f"[{session.session_id}] Run Agent clicked, waiting UI update...")
@@ -498,9 +474,7 @@ async def _open_browser_and_submit_for_session(
     if task_textarea is None:
         raise RuntimeError("Task textarea not available after clicking Run Agent repeatedly.")
 
-    # ============================================================
-    # 输入任务内容
-    # ============================================================
+    # ---------- 输入任务 ----------
     try:
         await task_textarea.scroll_into_view_if_needed()
     except Exception:
@@ -510,9 +484,7 @@ async def _open_browser_and_submit_for_session(
     await task_textarea.fill(task_text)
     logger.info(f"[{session.session_id}] 📝 Filled task text.")
 
-    # ============================================================
-    # 点击 Submit Task
-    # ============================================================
+    # ---------- 找 Submit Task 按钮并点击 ----------
     logger.info(f"[{session.session_id}] Searching for Submit Task button...")
 
     buttons = page.locator("button")
@@ -586,7 +558,7 @@ class AsyncWorker:
 # -----------------------------
 # FastAPI
 # -----------------------------
-app = FastAPI(title="UI Task Runner", version="3.0.0")
+app = FastAPI(title="UI Task Runner", version="3.1.0")
 worker = AsyncWorker()
 
 class ActionReq(BaseModel):
@@ -601,16 +573,16 @@ class ActionReq(BaseModel):
     host: Optional[str] = None
     port: Optional[int] = None
     headless: Optional[bool] = False
-    run_tab_selectors: Optional[List[str]] = None
-    max_wait_ms: Optional[int] = 15_000
-    settle_delay_ms: Optional[int] = 2_000
+    run_tab_selectors: Optional[List[str]] = None   # 当前未使用，仅兼容
+    max_wait_ms: Optional[int] = 15_000             # 当前未使用，仅兼容
+    settle_delay_ms: Optional[int] = 2_000          # 当前未使用，仅兼容
 
     # External browser selection
     browser: Optional[str] = "chromium"           # "chromium" | "firefox" | "webkit"
     browser_channel: Optional[str] = None         # Only for chromium
     executable_path: Optional[str] = None         # Only for chromium
 
-    # Connect to external browser directly via CDP
+    # Connect to external browser directly via CDP（本版本未使用，仅兼容字段）
     browser_cdp__url: Optional[str] = None
 
 class ActionResp(BaseModel):
@@ -618,6 +590,7 @@ class ActionResp(BaseModel):
     message: str
     session_id: Optional[str] = None
     webui_url: Optional[str] = None
+    webui_ws_url: Optional[str] = None    # ✅ 新增：对应的 WebSocket URL
     pid: Optional[int] = None
     browser: Optional[str] = None
     browser_channel: Optional[str] = None
@@ -634,6 +607,9 @@ def health():
                     "session_id": sid,
                     "host": s.host,
                     "port": s.port,
+                    "ws_port": s.ws_port,  # ✅ 新增：WS 端口
+                    "webui_url": f"http://{s.host}:{s.port}" if s.port else None,
+                    "webui_ws_url": f"ws://{s.host}:{s.ws_port}" if s.ws_port else None,
                     "webui_pid": s.webui_proc.pid if s.webui_proc else None,
                     "browser_open": bool(s.browser is not None),
                     "browser": s.browser_name,
@@ -689,7 +665,7 @@ def handle_action(req: ActionReq):
                 llm_base_url=req.llm_base_url,
             )
 
-            # 启动当前 session 的 webui.py
+            # 启动当前 session 的 webui.py（含独立 WS 端口）
             def _start_proc():
                 return launch_webui_process_for_session(session)
             proc, real_port = await asyncio.get_event_loop().run_in_executor(None, _start_proc)
@@ -700,14 +676,10 @@ def handle_action(req: ActionReq):
                 session=session,
                 webui_url=webui_url,
                 task_text=req.task.strip(),
-                run_tab_selectors=req.run_tab_selectors,
                 headless=bool(req.headless),
-                max_wait_ms=int(req.max_wait_ms or 15000),
-                settle_delay_ms=int(req.settle_delay_ms or 2000),
                 browser_name=(req.browser or "chromium"),
                 browser_channel=req.browser_channel,
                 executable_path=req.executable_path,
-                browser_cdp_url=req.browser_cdp__url,
             )
 
             return webui_url, proc.pid, session
@@ -722,11 +694,13 @@ def handle_action(req: ActionReq):
                 msg += f" Updated llm_model_name={req.llm_model_name}."
             if req.llm_base_url is not None:
                 msg += f" Updated llm_base_url={req.llm_base_url}."
+            ws_url = f"ws://{session.host}:{session.ws_port}" if session.ws_port else None
             return ActionResp(
                 status="accepted",
                 message=msg,
                 session_id=session_id,
                 webui_url=webui_url,
+                webui_ws_url=ws_url,
                 pid=pid,
                 browser=session.browser_name,
                 browser_channel=session.browser_channel,
@@ -831,12 +805,14 @@ def handle_action(req: ActionReq):
                                 extra += " | auto-recover: no prompt; no ENTER sent"
 
             webui_url = f"http://{session.host}:{session.port}"
+            ws_url = f"ws://{session.host}:{session.ws_port}" if session.ws_port else None
             msg = f"{req.Action} accepted for session={session.session_id} (clicked {btn}).{extra}"
             return ActionResp(
                 status="accepted",
                 message=msg,
                 session_id=session.session_id,
                 webui_url=webui_url,
+                webui_ws_url=ws_url,
                 browser=session.browser_name,
                 browser_channel=session.browser_channel,
                 executable_path=session.exec_path,

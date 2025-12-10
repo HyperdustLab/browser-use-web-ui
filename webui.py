@@ -8,6 +8,7 @@ import logging
 import asyncio
 import threading
 import websockets
+import os  # ✅ 新增：读取环境变量
 from src.webui.interface import theme_map, create_ui
 
 websocket_clients = set()
@@ -31,12 +32,16 @@ async def websocket_handler(websocket):
         websocket_clients.remove(websocket)
         debug(f"[WS] Client disconnected, remaining connections: {len(websocket_clients)}")
 
-# ✅ WebSocket server main loop
+# ✅ WebSocket server main loop（端口从环境变量读取）
 async def websocket_server():
     global websocket_loop
     websocket_loop = asyncio.get_running_loop()
-    debug("[WS] Starting WebSocket service: ws://0.0.0.0:8765")
-    async with websockets.serve(websocket_handler, "0.0.0.0", 8765, ping_interval=None):
+
+    # ✅ 关键修改点：从环境变量中读取 WS 端口，默认 8765
+    ws_port = int(os.environ.get("WEBUI_WS_PORT", "8765"))
+
+    debug(f"[WS] Starting WebSocket service: ws://0.0.0.0:{ws_port}")
+    async with websockets.serve(websocket_handler, "0.0.0.0", ws_port, ping_interval=None):
         await asyncio.Future()
 
 def start_websocket_server():
