@@ -51,6 +51,30 @@ def load_llm_settings_from_webui_json() -> (Optional[str], Optional[str]):
     return model_name, base_url
 
 
+def get_api_key_from_env() -> str:
+    """
+    Get API key from environment variable.
+    - Returns API key from LLM_API_KEY environment variable
+    - Returns empty string if not set
+    """
+    api_key = os.getenv("LLM_API_KEY", "")
+    if api_key:
+        logger.info("[agent_settings_tab] Loaded API key from environment variable: LLM_API_KEY")
+    return api_key
+
+
+def get_planner_api_key_from_env() -> str:
+    """
+    Get planner API key from environment variable.
+    - Returns API key from PLANNER_LLM_API_KEY environment variable
+    - Returns empty string if not set
+    """
+    api_key = os.getenv("PLANNER_LLM_API_KEY", "")
+    if api_key:
+        logger.info("[agent_settings_tab] Loaded planner API key from environment variable: PLANNER_LLM_API_KEY")
+    return api_key
+
+
 # =========================
 # Other existing logic
 # =========================
@@ -114,6 +138,10 @@ def create_agent_settings_tab(webui_manager: WebuiManager):
     )
     # Base URL initial value priority: webui.json > original default
     initial_base_url_value = llm_base_url_default or "https://api.openai-proxy.org/v1"
+    # API Key initial value: from environment variable
+    initial_api_key_value = get_api_key_from_env()
+    # Planner API Key initial value: from environment variable
+    initial_planner_api_key_value = get_planner_api_key_from_env()
 
     with gr.Group():
         with gr.Column():
@@ -188,8 +216,8 @@ def create_agent_settings_tab(webui_manager: WebuiManager):
             llm_api_key = gr.Textbox(
                 label="API Key",
                 type="password",
-                value="",  # No longer preset any API key
-                info="Your API key (leave blank to use .env)"
+                value=initial_api_key_value,  # Load from environment variable
+                info="Your API key (loaded from environment variable if available)"
             )
 
     with gr.Group():
@@ -245,8 +273,8 @@ def create_agent_settings_tab(webui_manager: WebuiManager):
             planner_llm_api_key = gr.Textbox(
                 label="API Key",
                 type="password",
-                value="",
-                info="Your API key (leave blank to use .env)"
+                value=initial_planner_api_key_value,  # Load from environment variable
+                info="Your API key (loaded from environment variable if available)"
             )
 
     with gr.Row():

@@ -1,5 +1,12 @@
 FROM python:3.11-slim-bookworm
 
+# Optional: switch Debian APT mirror to improve connectivity (default: deb.debian.org)
+# 可通过 --build-arg APT_MIRROR=https://mirrors.aliyun.com/debian 覆盖
+ARG APT_MIRROR=https://mirrors.aliyun.com/debian
+RUN echo "deb ${APT_MIRROR} bookworm main contrib non-free non-free-firmware" > /etc/apt/sources.list \
+    && echo "deb ${APT_MIRROR}-security bookworm-security main contrib non-free non-free-firmware" >> /etc/apt/sources.list \
+    && echo "deb ${APT_MIRROR} bookworm-updates main contrib non-free non-free-firmware" >> /etc/apt/sources.list
+
 # Set platform for multi-arch builds (Docker Buildx will set this)
 ARG TARGETPLATFORM
 ARG NODE_MAJOR=20
@@ -51,12 +58,9 @@ RUN git clone https://github.com/novnc/noVNC.git /opt/novnc \
     && git clone https://github.com/novnc/websockify /opt/novnc/utils/websockify \
     && ln -s /opt/novnc/vnc.html /opt/novnc/index.html
 
-# Install Node.js using NodeSource PPA
-RUN mkdir -p /etc/apt/keyrings \
-    && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
-    && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_$NODE_MAJOR.x nodistro main" | tee /etc/apt/sources.list.d/nodesource.list \
-    && apt-get update \
-    && apt-get install nodejs -y \
+# Install Node.js (Debian repo; bookworm ships Node 18.x)
+RUN apt-get update \
+    && apt-get install -y nodejs npm \
     && rm -rf /var/lib/apt/lists/*
 
 # Verify Node.js and npm installation (optional, but good for debugging)
@@ -89,11 +93,11 @@ RUN playwright install chromium --with-deps
 # Copy the application code
 COPY . .
 
-# Set up supervisor configuration
-RUN mkdir -p /var/log/supervisor
-COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
+# Create tmp directory for http_run.py
+RUN mkdir -p /app/tmp
 
-EXPOSE 7788 6080 5901 9222
+# Expose ports: 7788 (webui), 6080 (novnc), 5901 (vnc), 9222 (debug), 9000 (http_run.py API)
+EXPOSE 7788 6080 5901 9222 9000
 
-CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf"]
-#CMD ["/bin/bash"]
+# Use http_run.py instead of supervisord
+CMD ["python", "http_run.py"]
