@@ -188,7 +188,7 @@ def create_agent_settings_tab(webui_manager: WebuiManager):
             llm_api_key = gr.Textbox(
                 label="API Key",
                 type="password",
-                value="sk-NQl0lA710pUeCP6WaknqnXSvR0Ee8YRhQpON3ydKp8uZTiq5",  # No longer preset any API key
+                value="",  # No longer preset any API key
                 info="Your API key (leave blank to use .env)"
             )
 

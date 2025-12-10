@@ -8,8 +8,9 @@ import json
 import socket
 import threading
 import subprocess
-from typing import Optional, List, Awaitable
+from typing import Optional, List, Awaitable, Dict, Any
 from collections import deque
+from dataclasses import dataclass, field
 
 # Optional: Using psutil is more stable (it's okay if not present)
 try:
@@ -26,6 +27,7 @@ import asyncio
 import urllib.request
 import urllib.error
 import logging
+import uuid
 
 # -----------------------------
 # Logging
@@ -55,42 +57,11 @@ PYTHON_EXE = os.environ.get("WEBUI_PYTHON", sys.executable)
 DEFAULT_WEBUI_HOST = os.environ.get("WEBUI_HOST", "127.0.0.1")
 DEFAULT_WEBUI_PORT = int(os.environ.get("WEBUI_PORT", "7788"))  # Keep in sync with webui.py
 
-# ====== Optional pid file for managing webui.py instances started by this script ======
-PID_DIR = os.path.join(BASE_DIR, "tmp")
-PID_FILE = os.path.join(PID_DIR, "webui.pid")
+# ====== Global Playwright state (shared between sessions) ======
+_playwright = None  # type: ignore
 
-
-WEBUI_PROC: Optional[subprocess.Popen] = None
-
-# ====== Current WebUI and browser status ======
-CURRENT_HOST: Optional[str] = None
-CURRENT_PORT: Optional[int] = None
-CURRENT_BROWSER_NAME: Optional[str] = None
-CURRENT_BROWSER_CHANNEL: Optional[str] = None
-CURRENT_EXEC_PATH: Optional[str] = None
-CURRENT_CDP_URL: Optional[str] = None
-_current_lock = threading.Lock()
-
-# ====== Global Playwright state (reusing browser/page across requests) ======
-_playwright = None
-_browser = None
-_context = None
-_page = None
-
-
+# ====== Resume / Pause timing constants (per session uses same constants) ======
 ENTER_PROMPT_SUBSTR = "Press [Enter] to resume"
-ENTER_PROMPT_EVENT = threading.Event()
-ENTER_PROMPT_LOCK = threading.Lock()
-ENTER_PROMPT_LAST_TS = 0.0
-
-
-LAST_PAUSE_TS = 0.0
-ENTER_CONSUMED_EVENT = threading.Event()
-ENTER_CONSUMED_LAST_TS = 0.0
-
-
-LAST_LINES = deque(maxlen=200)
-
 
 RESUME_WAIT_FOR_PROMPT_SECONDS = 2.0
 RESUME_FALLBACK_SEND_ENTER = True
@@ -116,7 +87,7 @@ def write_or_update_webui_json(
     """
     logger.info("Writing to webui.json.")
     ensure_dir_for(WEBUI_JSON_PATH)
-    data = {}
+    data: Dict[str, Any] = {}
     if os.path.exists(WEBUI_JSON_PATH):
         try:
             with open(WEBUI_JSON_PATH, "r", encoding="utf-8") as f:
@@ -164,7 +135,7 @@ def wait_http_ok(url: str, timeout_s: float = 60.0, interval_s: float = 1.0) -> 
     return False
 
 # -----------------------------
-# Process management: Kill webui.py
+# Process helpers (per pid)
 # -----------------------------
 def _kill_pid(pid: int, force: bool = False):
     if psutil:
@@ -180,8 +151,11 @@ def _kill_pid(pid: int, force: bool = False):
     else:
         try:
             if os.name == "nt":
-                subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
             else:
                 import signal
                 os.kill(pid, signal.SIGTERM)
@@ -190,97 +164,97 @@ def _kill_pid(pid: int, force: bool = False):
         except Exception:
             pass
 
-def _pids_listening_on_port(port: int) -> List[int]:
-    pids = []
-    if psutil:
-        try:
-            for c in psutil.net_connections(kind="inet"):
-                if c.laddr and c.laddr.port == port and c.status == psutil.CONN_LISTEN and c.pid:
-                    pids.append(c.pid)
-        except Exception:
-            pass
-    else:
-        try:
-            if os.name == "nt":
-                out = subprocess.check_output(["netstat", "-ano"], text=True, creationflags=subprocess.CREATE_NO_WINDOW)
-                for line in out.splitlines():
-                    if f":{port} " in line and "LISTENING" in line:
-                        parts = line.split()
-                        pids.append(int(parts[-1]))
-        except Exception:
-            pass
-    return list(sorted(set(pids)))
+# -----------------------------
+# Session State (multi-task support)
+# -----------------------------
+@dataclass
+class SessionState:
+    session_id: str
+    host: str
+    port: int
+    webui_proc: Optional[subprocess.Popen] = None
 
-def kill_existing_webui(host: str, port: int):
-    logger.info("🛑 Attempting to stop existing webui.py.")
-    if os.path.exists(PID_FILE):
-        try:
-            with open(PID_FILE, "r", encoding="utf-8") as f:
-                pid = int(f.read().strip())
-            _kill_pid(pid)
-        except Exception:
-            pass
-        try:
-            os.remove(PID_FILE)
-        except Exception:
-            pass
-    if psutil:
-        try:
-            for p in psutil.process_iter(attrs=["pid", "name", "cmdline"]):
-                try:
-                    cmdline = " ".join(p.info.get("cmdline") or [])
-                    if "webui.py" in cmdline:
-                        _kill_pid(p.info["pid"])
-                except Exception:
-                    continue
-        except Exception:
-            pass
-    for pid in _pids_listening_on_port(port):
-        _kill_pid(pid, force=True)
-    for _ in range(20):  # Wait up to ~4s
-        if is_port_free(host, port):
-            break
-        time.sleep(0.2)
+    # Playwright browser state
+    browser: Any = None
+    context: Any = None
+    page: Any = None
+
+    browser_name: Optional[str] = None
+    browser_channel: Optional[str] = None
+    exec_path: Optional[str] = None
+    cdp_url: Optional[str] = None
+
+    # CLI / log based resume-prompt state
+    enter_prompt_substr: str = ENTER_PROMPT_SUBSTR
+    enter_prompt_event: threading.Event = field(default_factory=threading.Event)
+    enter_prompt_lock: threading.Lock = field(default_factory=threading.Lock)
+    enter_prompt_last_ts: float = 0.0
+
+    last_pause_ts: float = 0.0
+    enter_consumed_event: threading.Event = field(default_factory=threading.Event)
+    enter_consumed_last_ts: float = 0.0
+
+    last_lines: deque = field(default_factory=lambda: deque(maxlen=200))
+
+_sessions: Dict[str, SessionState] = {}
+_sessions_lock = threading.Lock()
+
+def get_session(session_id: str) -> SessionState:
+    with _sessions_lock:
+        s = _sessions.get(session_id)
+        if not s:
+            raise KeyError(f"Session not found: {session_id}")
+        return s
+
+def create_session(session_id: str, host: str, port: int) -> SessionState:
+    with _sessions_lock:
+        if session_id in _sessions:
+            raise ValueError(f"Session already exists: {session_id}")
+        s = SessionState(session_id=session_id, host=host, port=port)
+        _sessions[session_id] = s
+        return s
+
+def remove_session(session_id: str):
+    with _sessions_lock:
+        _sessions.pop(session_id, None)
 
 # -----------------------------
-# Subprocess output handling (with prompt/pause/enter consumption matching)
+# Subprocess output handling (per session)
 # -----------------------------
-def _pump_output(proc: subprocess.Popen, prefix: str):
+def _pump_output_for_session(proc: subprocess.Popen, session: SessionState, prefix: str):
     def _reader(stream):
-        global ENTER_PROMPT_LAST_TS, LAST_PAUSE_TS, ENTER_CONSUMED_LAST_TS
         for line in iter(stream.readline, b""):
             try:
-                text = line.decode(errors='ignore')
+                text = line.decode(errors="ignore")
             except Exception:
                 text = ""
 
-            # Print
+            # Print to stdout
             try:
                 sys.stdout.write(f"{prefix}{text}")
                 sys.stdout.flush()
             except Exception:
                 pass
 
-            # Record recent lines
             if text:
-                LAST_LINES.append(text.rstrip("\n"))
+                session.last_lines.append(text.rstrip("\n"))
 
-            # —— 1) CLI prompts "Press [Enter] to resume ..."
-            if ENTER_PROMPT_SUBSTR in text:
-                with ENTER_PROMPT_LOCK:
-                    ENTER_PROMPT_LAST_TS = time.time()
-                    ENTER_PROMPT_EVENT.set()
-                logger.debug("Detected CLI resume prompt; event set.")
+            # 1) Detect CLI prompt "Press [Enter] to resume"
+            if session.enter_prompt_substr in text:
+                with session.enter_prompt_lock:
+                    session.enter_prompt_last_ts = time.time()
+                    session.enter_prompt_event.set()
+                logger.debug(f"[{session.session_id}] Detected CLI resume prompt; event set.")
 
-            # —— 2) UI/CLI pause traces
+            # 2) Detect pause traces
             if ("Pause button clicked." in text) or ("Got Ctrl+C, paused" in text):
-                LAST_PAUSE_TS = time.time()
+                session.last_pause_ts = time.time()
 
-            # —— 3) CLI prints "Got Enter, resuming ..."
+            # 3) Detect "Got Enter, resuming"
             if "Got Enter, resuming" in text:
-                ENTER_CONSUMED_LAST_TS = time.time()
-                ENTER_CONSUMED_EVENT.set()
-                logger.debug("Detected ENTER already consumed by CLI.")
+                session.enter_consumed_last_ts = time.time()
+                session.enter_consumed_event.set()
+                logger.debug(f"[{session.session_id}] Detected ENTER already consumed by CLI.")
 
     if proc.stdout:
         t = threading.Thread(target=_reader, args=(proc.stdout,), daemon=True)
@@ -293,37 +267,39 @@ def _watch_exit(proc: subprocess.Popen, label: str):
     threading.Thread(target=_waiter, daemon=True).start()
 
 # -----------------------------
-# Send "Enter" to webui.py process
+# Send "Enter" to a session's webui.py process
 # -----------------------------
-def send_enter_to_webui() -> bool:
-    """Write a newline to webui.py stdin to simulate pressing Enter in CLI."""
-    global WEBUI_PROC
-    if WEBUI_PROC is None:
-        logger.warning("send_enter_to_webui: WEBUI_PROC is None (webui not started by this process).")
+def send_enter_to_webui(session: SessionState) -> bool:
+    """Write a newline to this session's webui.py stdin to simulate pressing Enter in CLI."""
+    proc = session.webui_proc
+    if proc is None:
+        logger.warning(f"[{session.session_id}] send_enter_to_webui: webui_proc is None.")
         return False
     try:
-        if WEBUI_PROC.stdin:
-            WEBUI_PROC.stdin.write(b"\n")
-            WEBUI_PROC.stdin.flush()
-            logger.info("▶️  Sent ENTER to webui.py stdin.")
+        if proc.stdin:
+            proc.stdin.write(b"\n")
+            proc.stdin.flush()
+            logger.info(f"[{session.session_id}] ▶️  Sent ENTER to webui.py stdin.")
             return True
         else:
-            logger.warning("send_enter_to_webui: WEBUI_PROC.stdin is None.")
+            logger.warning(f"[{session.session_id}] send_enter_to_webui: stdin is None.")
             return False
     except Exception as e:
-        logger.exception(f"send_enter_to_webui failed: {e}")
+        logger.exception(f"[{session.session_id}] send_enter_to_webui failed: {e}")
         return False
 
 # -----------------------------
-# Launch webui.py
+# Launch webui.py for a session
 # -----------------------------
-def launch_webui_process(host: str, port: int):
+def launch_webui_process_for_session(session: SessionState):
+    host = session.host
+    port = session.port
+
     chosen_port = port
     if not is_port_free(host, chosen_port):
-        logger.warning(f"Port {chosen_port} is occupied, automatically selecting a free port")
+        logger.warning(f"[{session.session_id}] Port {chosen_port} is occupied, automatically selecting a free port")
         chosen_port = find_free_port(host)
 
-    ensure_dir_for(PID_FILE)
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
 
@@ -340,54 +316,44 @@ def launch_webui_process(host: str, port: int):
                     _ollama = _ollama[: -len(_sfx)]
             if _ollama:
                 env["OLLAMA_HOST"] = _ollama
-                logger.info(f"Set OLLAMA_HOST={env['OLLAMA_HOST']} for subprocess")
+                logger.info(f"[{session.session_id}] Set OLLAMA_HOST={env['OLLAMA_HOST']} for subprocess")
         else:
-            logger.info(f"webui.json not found ({WEBUI_JSON_PATH}), skipping OLLAMA_HOST injection")
+            logger.info(f"[{session.session_id}] webui.json not found ({WEBUI_JSON_PATH}), skipping OLLAMA_HOST injection")
     except Exception as e:
-        logger.warning(f"Failed to read webui.json to set OLLAMA_HOST: {e}")
+        logger.warning(f"[{session.session_id}] Failed to read webui.json to set OLLAMA_HOST: {e}")
 
     cmd = [PYTHON_EXE, WEBUI_SCRIPT_PATH, "--ip", host, "--port", str(chosen_port)]
-    logger.info("🚀 Launching webui.py: %s", " ".join(cmd))
+    logger.info(f"[{session.session_id}] 🚀 Launching webui.py: %s", " ".join(cmd))
     proc = subprocess.Popen(
         cmd,
         cwd=BASE_DIR,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        stdin=subprocess.PIPE,          # ✅ Enable stdin for Resume to write Enter
+        stdin=subprocess.PIPE,
         env=env,
-        creationflags=0
+        creationflags=0,
     )
 
-    # Save to global handle
-    global WEBUI_PROC
-    WEBUI_PROC = proc
+    session.webui_proc = proc
+    session.port = chosen_port
 
-    _pump_output(proc, "[webui.py] ")
-    _watch_exit(proc, "webui.py")
-
-    try:
-        with open(PID_FILE, "w", encoding="utf-8") as f:
-            f.write(str(proc.pid))
-    except Exception:
-        pass
+    _pump_output_for_session(proc, session, f"[webui.py:{session.session_id}] ")
+    _watch_exit(proc, f"webui.py({session.session_id})")
 
     root_url = f"http://{host}:{chosen_port}/"
-    ok = wait_http_ok(root_url, timeout_s=60.0, interval_s=1.0)  # ← 60s/1s
+    ok = wait_http_ok(root_url, timeout_s=60.0, interval_s=1.0)
     if ok:
-        logger.info("webui.py health check successful: %s", root_url)
+        logger.info(f"[{session.session_id}] webui.py health check successful: {root_url}")
     else:
-        logger.warning("webui.py health check not successful (may become ready later)")
-
-    global CURRENT_HOST, CURRENT_PORT
-    with _current_lock:
-        CURRENT_HOST, CURRENT_PORT = host, chosen_port
+        logger.warning(f"[{session.session_id}] webui.py health check not successful (may become ready later)")
 
     return proc, chosen_port
 
 # -----------------------------
-# Playwright: Launch/connect to browser & submit task
+# Playwright: Launch/connect browser & submit task (per session)
 # -----------------------------
-async def _open_fresh_browser_and_submit(
+async def _open_browser_and_submit_for_session(
+    session: SessionState,
     webui_url: str,
     task_text: str,
     run_tab_selectors: Optional[List[str]] = None,
@@ -400,181 +366,203 @@ async def _open_fresh_browser_and_submit(
     browser_cdp_url: Optional[str] = None,
 ):
     """
-    - Prefer connect_over_cdp if browser_cdp_url provided
-    - Otherwise launch specified engine (chromium|firefox|webkit)
-    - Open WebUI → Run Agent → fill textarea → Submit Task
-    - Keep browser open for Pause/Resume
+    打开 WebUI、确保 Run Agent tab 被点开、找到任务输入框、输入任务、点击 Submit Task。
+    集成 use.py 的“任务输入框检测 + Run Agent 点击逻辑”，并补上浏览器启动逻辑。
     """
-    global _playwright, _browser, _context, _page
-    global CURRENT_BROWSER_NAME, CURRENT_BROWSER_CHANNEL, CURRENT_EXEC_PATH, CURRENT_CDP_URL
+    global _playwright
 
-    # Close existing browser before new task
-    if _browser is not None:
-        try:
-            logger.info("Closing existing browser (before starting new task)...")
-            await _browser.close()
-        except Exception as e:
-            logger.warning(f"Error closing old browser: {e}")
-        finally:
-            _browser = _context = _page = None
-
+    # 1) 启动 Playwright（全局一次）
     if _playwright is None:
         _playwright = await async_playwright().start()
 
-    using_cdp = False
-    if browser_cdp_url:
-        logger.info(f"Connecting to external browser via CDP: {browser_cdp_url}")
-        _browser = await _playwright.chromium.connect_over_cdp(browser_cdp_url)
-        _context = _browser.contexts[0] if _browser.contexts else await _browser.new_context()
-        _page = await _context.new_page()
-        using_cdp = True
-        with _current_lock:
-            CURRENT_BROWSER_NAME = "chromium(cdp)"
-            CURRENT_BROWSER_CHANNEL = None
-            CURRENT_EXEC_PATH = None
-            CURRENT_CDP_URL = browser_cdp_url
-    else:
-        # Normal launch
-        browser_name = (browser_name or "chromium").lower().strip()
-        if browser_name not in ("chromium", "firefox", "webkit"):
-            logger.warning(f"Unknown browser '{browser_name}', using chromium instead")
-            browser_name = "chromium"
-        engine = getattr(_playwright, browser_name)
-        launch_args = dict(headless=headless)
-        if browser_name == "chromium":
-            if executable_path:
-                ep = os.path.normpath(os.path.expandvars(os.path.expanduser(executable_path)))
-                if not os.path.isfile(ep):
-                    raise ValueError(f"executable_path does not exist: {ep}")
-                launch_args["executable_path"] = ep
-            elif browser_channel:
-                launch_args["channel"] = browser_channel
+    # 2) 为当前 session 启动/连接浏览器 + 创建 page
+    if session.browser is None:
+        # 2.1 CDP 外部浏览器
+        if browser_cdp_url:
+            logger.info(f"[{session.session_id}] Connecting to external browser via CDP: {browser_cdp_url}")
+            browser = await _playwright.chromium.connect_over_cdp(browser_cdp_url)
+            context = browser.contexts[0] if browser.contexts else await browser.new_context()
+            page = await context.new_page()
+            session.browser_name = "chromium(cdp)"
+            session.browser_channel = None
+            session.exec_path = None
+            session.cdp_url = browser_cdp_url
         else:
-            if browser_channel:
-                logger.warning(f"{browser_name} does not support browser_channel, ignored")
-            if executable_path:
-                logger.warning(f"{browser_name} does not support executable_path, ignored")
-        logger.info(f"Launching browser: engine={browser_name}, args={ {k:v for k,v in launch_args.items() if v} }")
-        _browser = await engine.launch(**launch_args)
-        _context = await _browser.new_context()
-        _page = await _context.new_page()
-        with _current_lock:
-            CURRENT_BROWSER_NAME = browser_name
-            CURRENT_BROWSER_CHANNEL = browser_channel if browser_name == "chromium" else None
-            CURRENT_EXEC_PATH = launch_args.get("executable_path")
-            CURRENT_CDP_URL = None
+            # 2.2 本地启动浏览器
+            engine_name = (browser_name or "chromium").lower().strip()
+            if engine_name not in ("chromium", "firefox", "webkit"):
+                logger.warning(f"[{session.session_id}] Unknown browser '{engine_name}', fallback to chromium")
+                engine_name = "chromium"
+            engine = getattr(_playwright, engine_name)
+            launch_args: Dict[str, Any] = dict(headless=headless)
+            if engine_name == "chromium":
+                if executable_path:
+                    ep = os.path.normpath(os.path.expandvars(os.path.expanduser(executable_path)))
+                    if not os.path.isfile(ep):
+                        raise ValueError(f"executable_path does not exist: {ep}")
+                    launch_args["executable_path"] = ep
+                elif browser_channel:
+                    launch_args["channel"] = browser_channel
+            else:
+                if browser_channel:
+                    logger.warning(f"[{session.session_id}] {engine_name} does not support browser_channel, ignored")
+                if executable_path:
+                    logger.warning(f"[{session.session_id}] {engine_name} does not support executable_path, ignored")
 
-    logger.info(f"🌐 Opening WebUI page: {webui_url}")
-    await _page.goto(webui_url, wait_until="domcontentloaded")
+            logger.info(f"[{session.session_id}] Launching browser: engine={engine_name}, args={ {k:v for k,v in launch_args.items() if v} }")
+            browser = await engine.launch(**launch_args)
+            context = await browser.new_context()
+            page = await context.new_page()
 
-    # Click Run Agent tab
-    selectors = run_tab_selectors or [
-        "#component-82-button",
-        "button:has-text('Run Agent')",
-        "[id*='component'][id$='-button']:has-text('Run Agent')",
-        "role=button[name='Run Agent']",
-    ]
-    if settle_delay_ms > 0:
-        await asyncio.sleep(settle_delay_ms / 1000.0)
-    for sel in selectors:
-        try:
-            logger.debug(f"Attempting to click tab: {sel}")
-            await _page.click(sel, timeout=4000)
-            break
-        except Exception:
-            pass
+            session.browser_name = engine_name
+            session.browser_channel = browser_channel if engine_name == "chromium" else None
+            session.exec_path = launch_args.get("executable_path")
+            session.cdp_url = None
 
-    # Visible textarea
+        session.browser = browser
+        session.context = context
+        session.page = page
+    else:
+        page = session.page
+
+    TASK_PLACEHOLDER = "Enter your task here or provide assistance when asked."
+
+    # 打开 URL
+    logger.info(f"[{session.session_id}] 🌐 Opening WebUI page: {webui_url}")
+    await page.goto(webui_url)
+
+    # 等 WebUI 初步渲染
     try:
-        await _page.wait_for_selector("textarea", timeout=max_wait_ms, state="attached")
-    except Exception as e:
-        raise RuntimeError(f"No textarea found on page: {e}")
-
-    textareas = _page.locator("textarea")
-    count = await textareas.count()
-    target = None
-    for i in range(min(count, 25)):
-        handle = textareas.nth(i)
-        try:
-            if await handle.is_visible():
-                target = handle
-                break
-        except Exception:
-            continue
-    if target is None:
-        target = textareas.first
-    try:
-        await target.scroll_into_view_if_needed(timeout=3000)
+        await page.wait_for_load_state("networkidle", timeout=max_wait_ms * 4)
     except Exception:
         pass
+    await asyncio.sleep(settle_delay_ms / 1000.0)
 
-    # Fill task
-    try:
-        await target.fill(task_text, timeout=max_wait_ms)
-    except Exception:
-        try:
-            await target.click(timeout=3000)
-            await _page.keyboard.type(task_text, delay=20)
-        except Exception as e:
-            raise RuntimeError(f"Failed to fill task into textarea: {e}")
-
-    # Submit
-    try:
-        await _page.click("button:has-text('Submit Task')", timeout=max_wait_ms)
-    except Exception:
-        buttons = _page.locator("button")
-        bcount = await buttons.count()
-        clicked = False
-        for i in range(min(bcount, 30)):
-            b = buttons.nth(i)
+    async def click_run_agent_once():
+        """
+        完全使用你“第一版 http_run.py”的 Run Agent 点击逻辑。
+        """
+        selectors = run_tab_selectors or [
+            "#component-82-button",
+            "button:has-text('Run Agent')",
+            "[id*='component'][id$='-button']:has-text('Run Agent')",
+            "role=button[name='Run Agent']",
+        ]
+        for sel in selectors:
             try:
-                if await b.is_visible():
-                    await b.click()
-                    clicked = True
+                logger.debug(f"[{session.session_id}] Try click run agent: {sel}")
+                await page.click(sel, timeout=4000)
+                logger.info(f"[{session.session_id}] Clicked Run Agent via: {sel}")
+                return True
+            except Exception as e:
+                logger.debug(f"[{session.session_id}] Selector failed: {sel}  err={e}")
+        return False
+
+    # ============================================================
+    # 循环等待任务输入框出现，如果没有就继续点 Run Agent
+    # ============================================================
+    deadline = time.time() + 120
+    task_textarea = None
+
+    while time.time() < deadline:
+        logger.debug(f"[{session.session_id}] Checking for task textarea...")
+
+        # 每轮检查任务输入框
+        tas = page.locator(f"textarea[placeholder='{TASK_PLACEHOLDER}']")
+        count_ta = await tas.count()
+        visible_handle = None
+        for i in range(count_ta):
+            h = tas.nth(i)
+            try:
+                if await h.is_visible():
+                    visible_handle = h
                     break
             except Exception:
                 continue
-        if not clicked:
-            raise RuntimeError("No clickable button found on page (cannot submit task).")
 
-    logger.info("✅ Task submitted (browser remains open for Pause/Resume)")
+        if visible_handle:
+            logger.info(f"[{session.session_id}] Task textarea detected, UI ready.")
+            task_textarea = visible_handle
+            break
 
-    # CDP mode: Clean up extra tabs
-    if using_cdp:
+        logger.debug(f"[{session.session_id}] Task textarea not found, clicking Run Agent...")
+
+        clicked = await click_run_agent_once()
+        if clicked:
+            logger.debug(f"[{session.session_id}] Run Agent clicked, waiting UI update...")
+        else:
+            logger.debug(f"[{session.session_id}] No selectors worked this round.")
+
+        await asyncio.sleep(2)
+
+    if task_textarea is None:
+        raise RuntimeError("Task textarea not available after clicking Run Agent repeatedly.")
+
+    # ============================================================
+    # 输入任务内容
+    # ============================================================
+    try:
+        await task_textarea.scroll_into_view_if_needed()
+    except Exception:
+        pass
+
+    await task_textarea.click()
+    await task_textarea.fill(task_text)
+    logger.info(f"[{session.session_id}] 📝 Filled task text.")
+
+    # ============================================================
+    # 点击 Submit Task
+    # ============================================================
+    logger.info(f"[{session.session_id}] Searching for Submit Task button...")
+
+    buttons = page.locator("button")
+    count_btn = await buttons.count()
+    submit_button = None
+
+    for i in range(count_btn):
         try:
-            for ctx in list(_browser.contexts):
-                for pg in list(ctx.pages):
-                    try:
-                        if pg != _page and not pg.is_closed():
-                            await pg.close()
-                    except Exception:
-                        continue
-            logger.info("🔧 Closed extra tabs, keeping only current page.")
-        except Exception as e:
-            logger.warning(f"Failed to clean up extra tabs: {e}")
+            btn = buttons.nth(i)
+            if not await btn.is_visible():
+                continue
+            text = (await btn.inner_text()).strip()
+            if "Submit Task" in text or "▶️ Submit Task" in text:
+                submit_button = btn
+                logger.info(f"[{session.session_id}] Found Submit Task button[{i}]: {text}")
+                break
+        except Exception:
+            continue
+
+    if not submit_button:
+        raise RuntimeError("Could not find Submit Task button.")
+
+    try:
+        await submit_button.scroll_into_view_if_needed()
+    except Exception:
+        pass
+
+    await submit_button.click(timeout=15000)
+    logger.info(f"[{session.session_id}] ▶️ Submit Task clicked successfully.")
 
 # -----------------------------
-# Click button on current page (Pause/Resume)
+# Click button on current page (Pause/Resume) for session
 # -----------------------------
-async def _click_button_on_current_page(button_text: str, max_wait_ms: int = 10_000):
-    global _page
-    if _page is None:
-        raise RuntimeError("No connected browser page available; please Start first.")
-    await _page.click(f"button:has-text('{button_text}')", timeout=max_wait_ms)
-    logger.info(f"✅ Clicked button: {button_text}")
+async def _click_button_on_current_page(session: SessionState, button_text: str, max_wait_ms: int = 10_000):
+    if session.page is None:
+        raise RuntimeError("No connected browser page available for this session; please Start first.")
+    await session.page.click(f"button:has-text('{button_text}')", timeout=max_wait_ms)
+    logger.info(f"[{session.session_id}] ✅ Clicked button: {button_text}")
 
 # -----------------------------
-# Close browser (Stop)
+# Close browser (Stop) for session
 # -----------------------------
-async def _close_browser_if_any():
-    global _page, _context, _browser
-    if _browser is not None:
+async def _close_browser_for_session(session: SessionState):
+    if session.browser is not None:
         try:
-            logger.info("Closing browser...")
-            await _browser.close()
+            logger.info(f"[{session.session_id}] Closing browser...")
+            await session.browser.close()
         except Exception as e:
-            logger.warning(f"Error closing browser: {e}")
-    _page = _context = _browser = None
+            logger.warning(f"[{session.session_id}] Error closing browser: {e}")
+    session.browser = session.context = session.page = None
 
 # -----------------------------
 # Background event loop
@@ -598,13 +586,12 @@ class AsyncWorker:
 # -----------------------------
 # FastAPI
 # -----------------------------
-app = FastAPI(title="UI Task Runner", version="2.11.0")
+app = FastAPI(title="UI Task Runner", version="3.0.0")
 worker = AsyncWorker()
-_task_lock = asyncio.Lock()
-_proc_lock = threading.Lock()
 
 class ActionReq(BaseModel):
     Action: str                  # "Start" | "Pause" | "Resume" | "Stop"
+    session_id: Optional[str] = None   # 每个任务/会话的 ID
     task: Optional[str] = None   # Required for Start
     cdp_URP: Optional[str] = None
     # LLM configuration
@@ -629,6 +616,7 @@ class ActionReq(BaseModel):
 class ActionResp(BaseModel):
     status: str
     message: str
+    session_id: Optional[str] = None
     webui_url: Optional[str] = None
     pid: Optional[int] = None
     browser: Optional[str] = None
@@ -638,20 +626,27 @@ class ActionResp(BaseModel):
 
 @app.get("/health")
 def health():
-    with _current_lock:
-        ch, cp = CURRENT_HOST, CURRENT_PORT
-        bn, bc, ep, cu = CURRENT_BROWSER_NAME, CURRENT_BROWSER_CHANNEL, CURRENT_EXEC_PATH, CURRENT_CDP_URL
+    with _sessions_lock:
+        sessions_info = []
+        for sid, s in _sessions.items():
+            sessions_info.append(
+                {
+                    "session_id": sid,
+                    "host": s.host,
+                    "port": s.port,
+                    "webui_pid": s.webui_proc.pid if s.webui_proc else None,
+                    "browser_open": bool(s.browser is not None),
+                    "browser": s.browser_name,
+                    "browser_channel": s.browser_channel,
+                    "executable_path": s.exec_path,
+                    "browser_cdp__url": s.cdp_url,
+                }
+            )
     return {
         "status": "ok",
         "script": WEBUI_SCRIPT_PATH,
         "json": WEBUI_JSON_PATH,
-        "current_host": ch,
-        "current_port": cp,
-        "browser_open": bool(_browser is not None),
-        "browser": bn,
-        "browser_channel": bc,
-        "executable_path": ep,
-        "browser_cdp__url": cu,
+        "sessions": sessions_info,
     }
 
 @app.get("/version")
@@ -678,61 +673,49 @@ def handle_action(req: ActionReq):
         if not req.task or not req.task.strip():
             raise HTTPException(status_code=400, detail="Start action requires a non-empty task")
 
+        # 生成/使用 session_id
+        session_id = req.session_id or uuid.uuid4().hex
+
+        try:
+            session = create_session(session_id, host, port)
+        except ValueError:
+            raise HTTPException(status_code=409, detail=f"Session already exists: {session_id}")
+
         async def _job_start():
-            async with _task_lock:
-                # Close old browser
-                await _close_browser_if_any()
+            # 写 webui.json
+            write_or_update_webui_json(
+                req.cdp_URP,
+                llm_model_name=req.llm_model_name,
+                llm_base_url=req.llm_base_url,
+            )
 
-                # Kill old webui
-                def _stop_proc():
-                    with _proc_lock:
-                        kill_existing_webui(host, port)
-                await asyncio.get_event_loop().run_in_executor(None, _stop_proc)
+            # 启动当前 session 的 webui.py
+            def _start_proc():
+                return launch_webui_process_for_session(session)
+            proc, real_port = await asyncio.get_event_loop().run_in_executor(None, _start_proc)
+            webui_url = f"http://{session.host}:{real_port}"
 
-                # Write json
-                write_or_update_webui_json(
-                    req.cdp_URP,
-                    llm_model_name=req.llm_model_name,
-                    llm_base_url=req.llm_base_url,
-                )
+            # 打开浏览器并提交任务
+            await _open_browser_and_submit_for_session(
+                session=session,
+                webui_url=webui_url,
+                task_text=req.task.strip(),
+                run_tab_selectors=req.run_tab_selectors,
+                headless=bool(req.headless),
+                max_wait_ms=int(req.max_wait_ms or 15000),
+                settle_delay_ms=int(req.settle_delay_ms or 2000),
+                browser_name=(req.browser or "chromium"),
+                browser_channel=req.browser_channel,
+                executable_path=req.executable_path,
+                browser_cdp_url=req.browser_cdp__url,
+            )
 
-                # Start webui
-                def _start_proc():
-                    with _proc_lock:
-                        return launch_webui_process(host, port)
-                proc, real_port = await asyncio.get_event_loop().run_in_executor(None, _start_proc)
-                webui_url = f"http://{host}:{real_port}"
-
-                # Open browser & submit
-                await _open_fresh_browser_and_submit(
-                    webui_url=webui_url,
-                    task_text=req.task.strip(),
-                    run_tab_selectors=req.run_tab_selectors,
-                    headless=bool(req.headless),
-                    max_wait_ms=int(req.max_wait_ms or 15000),
-                    settle_delay_ms=int(req.settle_delay_ms or 2000),
-                    browser_name=(req.browser or "chromium"),
-                    browser_channel=req.browser_channel,
-                    executable_path=req.executable_path,
-                    browser_cdp_url=req.browser_cdp__url,
-                )
-
-                with _current_lock:
-                    bn, bc, ep, cu = CURRENT_BROWSER_NAME, CURRENT_BROWSER_CHANNEL, CURRENT_EXEC_PATH, CURRENT_CDP_URL
-
-                return webui_url, proc.pid, bn, bc, ep, cu
+            return webui_url, proc.pid, session
 
         try:
             fut = worker.submit_coro(_job_start())
-            webui_url, pid, bn, bc, ep, cu = fut.result()
-            msg = f"Start accepted, WebUI: {webui_url}. Browser remains open (engine={bn}"
-            if bc:
-                msg += f", channel={bc}"
-            if ep:
-                msg += f", exec={ep}"
-            if cu:
-                msg += f", cdp={cu}"
-            msg += ")."
+            webui_url, pid, session = fut.result()
+            msg = f"Start accepted for session={session_id}, WebUI: {webui_url}. Browser remains open."
             if req.cdp_URP is not None:
                 msg += f" Updated cdp_URP in {WEBUI_JSON_PATH}."
             if req.llm_model_name is not None:
@@ -742,121 +725,122 @@ def handle_action(req: ActionReq):
             return ActionResp(
                 status="accepted",
                 message=msg,
+                session_id=session_id,
                 webui_url=webui_url,
                 pid=pid,
-                browser=bn,
-                browser_channel=bc,
-                executable_path=ep,
-                browser_cdp__url=cu,
+                browser=session.browser_name,
+                browser_channel=session.browser_channel,
+                executable_path=session.exec_path,
+                browser_cdp__url=session.cdp_url,
             )
         except HTTPException:
+            remove_session(session_id)
             raise
         except Exception as e:
             logger.exception("Start execution failed")
+            remove_session(session_id)
             raise HTTPException(status_code=500, detail=f"Start execution failed: {e}")
 
     # ---------- Pause / Resume ----------
     if action in ("pause", "resume"):
+        if not req.session_id:
+            raise HTTPException(status_code=400, detail="Pause/Resume requires session_id")
+        try:
+            session = get_session(req.session_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"Session not found: {req.session_id}")
+
         btn = "Pause" if action == "pause" else "Resume"
 
-        async def _job_click_resume_or_pause():
-            async with _task_lock:
-                await _click_button_on_current_page(button_text=btn)
+        async def _job_click():
+            await _click_button_on_current_page(session, button_text=btn)
 
         try:
-            # Record request timestamp (to determine if immediately re-paused)
             resume_req_ts = time.time()
-
-            # 1) First click UI's Pause/Resume
-            fut = worker.submit_coro(_job_click_resume_or_pause())
+            fut = worker.submit_coro(_job_click())
             fut.result()
 
             extra = ""
             if action == "resume":
-                # Clear events
-                with ENTER_PROMPT_LOCK:
-                    ENTER_PROMPT_EVENT.clear()
-                ENTER_CONSUMED_EVENT.clear()
+                # 清空事件
+                with session.enter_prompt_lock:
+                    session.enter_prompt_event.clear()
+                session.enter_consumed_event.clear()
 
-                # A) Wait for prompt
-                got_prompt = ENTER_PROMPT_EVENT.wait(timeout=RESUME_WAIT_FOR_PROMPT_SECONDS)
-
+                # A) 等待 CLI 提示
+                got_prompt = session.enter_prompt_event.wait(timeout=RESUME_WAIT_FOR_PROMPT_SECONDS)
                 if got_prompt:
-                    # Give a short observation window to see if any "stale Enter" was consumed
-                    ENTER_CONSUMED_EVENT.wait(timeout=RESUME_GRACE_FOR_CONSUME_SECONDS)
-                    if ENTER_CONSUMED_EVENT.is_set():
-                        # Already consumed, no new Enter sent
+                    session.enter_consumed_event.wait(timeout=RESUME_GRACE_FOR_CONSUME_SECONDS)
+                    if session.enter_consumed_event.is_set():
                         extra = " (detected prompt → ENTER already consumed)"
-                        with ENTER_PROMPT_LOCK:
-                            ENTER_PROMPT_EVENT.clear()
-                        ENTER_CONSUMED_EVENT.clear()
+                        with session.enter_prompt_lock:
+                            session.enter_prompt_event.clear()
+                        session.enter_consumed_event.clear()
                     else:
-                        ok = send_enter_to_webui()
+                        ok = send_enter_to_webui(session)
                         extra = " (detected prompt → ENTER x1)" if ok else " (prompt detected but send failed)"
-                        with ENTER_PROMPT_LOCK:
-                            ENTER_PROMPT_EVENT.clear()
+                        with session.enter_prompt_lock:
+                            session.enter_prompt_event.clear()
                 else:
-                    # No prompt received: also give short observation window, don't fallback if consumed
-                    ENTER_CONSUMED_EVENT.wait(timeout=RESUME_GRACE_FOR_CONSUME_SECONDS)
-                    if ENTER_CONSUMED_EVENT.is_set():
+                    # 没有提示，也给一个小观察窗口
+                    session.enter_consumed_event.wait(timeout=RESUME_GRACE_FOR_CONSUME_SECONDS)
+                    if session.enter_consumed_event.is_set():
                         extra = " (no prompt, but ENTER already consumed)"
-                        ENTER_CONSUMED_EVENT.clear()
+                        session.enter_consumed_event.clear()
                     else:
                         if RESUME_FALLBACK_SEND_ENTER:
-                            ok = send_enter_to_webui()
+                            ok = send_enter_to_webui(session)
                             extra = " (no prompt within timeout → fallback ENTER x1)" if ok else " (fallback send failed)"
                         else:
                             extra = " (no prompt; no ENTER sent)"
 
-                # B) Short observation after resume: if immediately paused again by UI → auto-recover with another Resume (using "already consumed" check)
+                # B) 观察是否立即又被 Pause，一次自动恢复
                 time.sleep(RESUME_OBSERVE_AFTER_SECONDS)
-                if LAST_PAUSE_TS > resume_req_ts:
-                    logger.warning("Detected immediate re-pause after resume. Performing one auto-recover resume.")
-                    fut2 = worker.submit_coro(_job_click_resume_or_pause())  # Still Resume
+                if session.last_pause_ts > resume_req_ts:
+                    logger.warning(f"[{session.session_id}] Detected immediate re-pause after resume. Performing one auto-recover resume.")
+                    fut2 = worker.submit_coro(_job_click())
                     fut2.result()
 
-                    with ENTER_PROMPT_LOCK:
-                        ENTER_PROMPT_EVENT.clear()
-                    ENTER_CONSUMED_EVENT.clear()
+                    with session.enter_prompt_lock:
+                        session.enter_prompt_event.clear()
+                    session.enter_consumed_event.clear()
 
-                    got_prompt2 = ENTER_PROMPT_EVENT.wait(timeout=RESUME_WAIT_FOR_PROMPT_SECONDS)
+                    got_prompt2 = session.enter_prompt_event.wait(timeout=RESUME_WAIT_FOR_PROMPT_SECONDS)
                     if got_prompt2:
-                        ENTER_CONSUMED_EVENT.wait(timeout=RESUME_GRACE_FOR_CONSUME_SECONDS)
-                        if ENTER_CONSUMED_EVENT.is_set():
+                        session.enter_consumed_event.wait(timeout=RESUME_GRACE_FOR_CONSUME_SECONDS)
+                        if session.enter_consumed_event.is_set():
                             extra += " | auto-recover: ENTER already consumed"
-                            with ENTER_PROMPT_LOCK:
-                                ENTER_PROMPT_EVENT.clear()
-                            ENTER_CONSUMED_EVENT.clear()
+                            with session.enter_prompt_lock:
+                                session.enter_prompt_event.clear()
+                            session.enter_consumed_event.clear()
                         else:
-                            ok2 = send_enter_to_webui()
+                            ok2 = send_enter_to_webui(session)
                             extra += " | auto-recover: ENTER x1" if ok2 else " | auto-recover: send failed"
-                            with ENTER_PROMPT_LOCK:
-                                ENTER_PROMPT_EVENT.clear()
+                            with session.enter_prompt_lock:
+                                session.enter_prompt_event.clear()
                     else:
-                        ENTER_CONSUMED_EVENT.wait(timeout=RESUME_GRACE_FOR_CONSUME_SECONDS)
-                        if ENTER_CONSUMED_EVENT.is_set():
+                        session.enter_consumed_event.wait(timeout=RESUME_GRACE_FOR_CONSUME_SECONDS)
+                        if session.enter_consumed_event.is_set():
                             extra += " | auto-recover: ENTER already consumed (no prompt)"
-                            ENTER_CONSUMED_EVENT.clear()
+                            session.enter_consumed_event.clear()
                         else:
                             if RESUME_FALLBACK_SEND_ENTER:
-                                ok2 = send_enter_to_webui()
+                                ok2 = send_enter_to_webui(session)
                                 extra += " | auto-recover: fallback ENTER x1" if ok2 else " | auto-recover: fallback failed"
                             else:
                                 extra += " | auto-recover: no prompt; no ENTER sent"
 
-            with _current_lock:
-                ch, cp = CURRENT_HOST, CURRENT_PORT
-                bn, bc, ep, cu = CURRENT_BROWSER_NAME, CURRENT_BROWSER_CHANNEL, CURRENT_EXEC_PATH, CURRENT_CDP_URL
-            webui_url = f"http://{ch or DEFAULT_WEBUI_HOST}:{cp or DEFAULT_WEBUI_PORT}"
-            msg = f"{req.Action} accepted (clicked {btn} on current page).{extra}"
+            webui_url = f"http://{session.host}:{session.port}"
+            msg = f"{req.Action} accepted for session={session.session_id} (clicked {btn}).{extra}"
             return ActionResp(
                 status="accepted",
                 message=msg,
+                session_id=session.session_id,
                 webui_url=webui_url,
-                browser=bn,
-                browser_channel=bc,
-                executable_path=ep,
-                browser_cdp__url=cu,
+                browser=session.browser_name,
+                browser_channel=session.browser_channel,
+                executable_path=session.exec_path,
+                browser_cdp__url=session.cdp_url,
             )
         except RuntimeError as e:
             raise HTTPException(status_code=409, detail=f"{req.Action} failed: {e}")
@@ -866,68 +850,54 @@ def handle_action(req: ActionReq):
 
     # ---------- Stop ----------
     if action == "stop":
-        with _current_lock:
-            ch, cp = CURRENT_HOST, CURRENT_PORT
-        host = (req.host or ch or DEFAULT_WEBUI_HOST).strip()
+        if not req.session_id:
+            raise HTTPException(status_code=400, detail="Stop requires session_id")
         try:
-            port = int(req.port) if req.port else (cp or DEFAULT_WEBUI_PORT)
-        except Exception:
-            port = cp or DEFAULT_WEBUI_PORT
+            session = get_session(req.session_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"Session not found: {req.session_id}")
 
         async def _job_stop():
-            async with _task_lock:
-                # 1) Close browser
-                await _close_browser_if_any()
+            # 1) Close browser
+            await _close_browser_for_session(session)
 
-                # 2) Try to stop webui.py we started via handle
-                global WEBUI_PROC
+            # 2) Stop webui.py by handle
+            proc = session.webui_proc
+            if proc is not None:
                 try:
-                    if WEBUI_PROC is not None:
-                        p = WEBUI_PROC
-                        WEBUI_PROC = None
+                    if psutil:
+                        ps_proc = psutil.Process(proc.pid)
+                        ps_proc.terminate()
                         try:
-                            if psutil:
-                                ps_proc = psutil.Process(p.pid)
-                                ps_proc.terminate()
-                                try:
-                                    ps_proc.wait(timeout=2)
-                                except Exception:
-                                    ps_proc.kill()
-                            else:
-                                if os.name == "nt":
-                                    subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"],
-                                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                                else:
-                                    import signal
-                                    os.kill(p.pid, signal.SIGTERM)
-                                    time.sleep(0.3)
-                                    os.kill(p.pid, signal.SIGKILL)
-                            logger.info(f"Stopped webui.py by handle (pid={p.pid}).")
-                        except Exception as e:
-                            logger.warning(f"Failed to stop webui.py by handle: {e}")
-                except Exception:
-                    pass
+                            ps_proc.wait(timeout=2)
+                        except Exception:
+                            ps_proc.kill()
+                    else:
+                        if os.name == "nt":
+                            subprocess.run(
+                                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                            )
+                        else:
+                            import signal
+                            os.kill(proc.pid, signal.SIGTERM)
+                            time.sleep(0.3)
+                            os.kill(proc.pid, signal.SIGKILL)
+                    logger.info(f"[{session.session_id}] Stopped webui.py by handle (pid={proc.pid}).")
+                except Exception as e:
+                    logger.warning(f"[{session.session_id}] Failed to stop webui.py by handle: {e}")
 
-                # 3) Fallback: Scan/kill by port
-                def _stop_proc():
-                    with _proc_lock:
-                        kill_existing_webui(host, port)
-                await asyncio.get_event_loop().run_in_executor(None, _stop_proc)
-
-                # 4) Clean up state
-                global CURRENT_HOST, CURRENT_PORT, CURRENT_BROWSER_NAME, CURRENT_BROWSER_CHANNEL, CURRENT_EXEC_PATH, CURRENT_CDP_URL
-                with _current_lock:
-                    CURRENT_HOST = CURRENT_PORT = None
-                    CURRENT_BROWSER_NAME = CURRENT_BROWSER_CHANNEL = CURRENT_EXEC_PATH = CURRENT_CDP_URL = None
-
-                logger.info(f"webui.py stop completed (host={host}, port={port}).")
+            session.webui_proc = None
 
         try:
             fut = worker.submit_coro(_job_stop())
             fut.result()
+            remove_session(session.session_id)
             return ActionResp(
                 status="ok",
-                message="Stop completed: closed browser and terminated webui.py (handle+port ensured)."
+                message=f"Stop completed for session={session.session_id}: closed browser and terminated webui.py.",
+                session_id=session.session_id,
             )
         except Exception as e:
             logger.exception("Stop execution failed")
