@@ -8,7 +8,10 @@ import logging
 import asyncio
 import threading
 import websockets
+import os  # ✅ 新增：读取环境变量
+import signal  # ✅ 新增：接管 Ctrl+C
 from src.webui.interface import theme_map, create_ui
+
 
 websocket_clients = set()
 websocket_loop = None  # ✅ Global event loop reference
@@ -31,12 +34,16 @@ async def websocket_handler(websocket):
         websocket_clients.remove(websocket)
         debug(f"[WS] Client disconnected, remaining connections: {len(websocket_clients)}")
 
-# ✅ WebSocket server main loop
+# ✅ WebSocket server main loop（端口从环境变量读取）
 async def websocket_server():
     global websocket_loop
     websocket_loop = asyncio.get_running_loop()
-    debug("[WS] Starting WebSocket service: ws://0.0.0.0:8765")
-    async with websockets.serve(websocket_handler, "0.0.0.0", 8765, ping_interval=None):
+
+    # ✅ 关键修改点：从环境变量中读取 WS 端口，默认 8765
+    ws_port = int(os.environ.get("WEBUI_WS_PORT", "8765"))
+
+    debug(f"[WS] Starting WebSocket service: ws://0.0.0.0:{ws_port}")
+    async with websockets.serve(websocket_handler, "0.0.0.0", ws_port, ping_interval=None):
         await asyncio.Future()
 
 def start_websocket_server():
@@ -58,13 +65,14 @@ def broadcast_log_message(message):
 
     if send_tasks and websocket_loop:
         try:
-            future = asyncio.run_coroutine_threadsafe(
-                asyncio.gather(*send_tasks, return_exceptions=True),
-                websocket_loop
-            )
+            async def _send_all():
+                return await asyncio.gather(*send_tasks, return_exceptions=True)
+
+            future = asyncio.run_coroutine_threadsafe(_send_all(), websocket_loop)
             future.result()
         except Exception as e:
             debug(f"[WS] Broadcast handler error: {e}")
+
 
 # ✅ Standard output stream interception (for capturing print and third-party output)
 class TeeLoggerStream:
@@ -84,24 +92,13 @@ class TeeLoggerStream:
             self._buffer = lines[-1]
 
     def flush(self):
-        # 先 flush 原始流，保证控制台/Gradio那边不被缓冲卡住
-        try:
-            self.original_stream.flush()
-        except Exception:
-            pass
-
-        # ✅ 关键：把还没遇到 \n 的残留 buffer 也发出去
-        if self._buffer and self._buffer.strip():
-            broadcast_log_message(self._buffer.strip())
-            self._buffer = ""
+        self.original_stream.flush()
 
     def isatty(self):
         return self.original_stream.isatty()
 
     def close(self):
-        # ✅ 可选：关闭时也把残留发出去，避免最后一段日志丢失/卡住
-        self.flush()
-
+        pass  # No file writing
 
 # ✅ logging handler → broadcast
 class BroadcastingHandler(logging.Handler):
@@ -143,6 +140,14 @@ def main():
 
 # ✅ Main program entry
 if __name__ == '__main__':
+    # ✅ 方案 A：接管 Ctrl+C，直接强退，避免卡在 “Press [Enter] to resume...”
+    def _hard_exit(signum, frame):
+        os._exit(0)
+
+    signal.signal(signal.SIGINT, _hard_exit)  # Ctrl+C
+    if hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, _hard_exit)  # Windows: Ctrl+Break
+
     debug("[MAIN] Starting WebSocket thread...")
     threading.Thread(target=start_websocket_server, daemon=True).start()
 
